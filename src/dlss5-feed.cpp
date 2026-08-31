@@ -148,11 +148,16 @@ static LONG WINAPI CrashFilter(EXCEPTION_POINTERS *ep)
 //    evaluate, making the warm-up re-create pure waste (and a small crash surface),
 //    and add the EnableHooks policy key ('2' = NGX-only, correct for this feeder,
 //    since '1' patches Streamline modules at a self-described contested site).
-// The 'EnableHooks' string in the binary is the v45+ marker.
+//  - v4.6 builds keep the v45+ engine (rescan every present, adopt lazily) and add
+//    global hotkeys, a rejected-upscaling latch and richer decline diagnostics;
+//    nothing they gate on is missing from the contract this feeder publishes.
+// The 'EnableHooks' string in the binary is the v45+ marker; 'NRToggleKey' is the
+// v4.6 one (its only new config keys are EnableHooks and the two hotkey binds).
 // ---------------------------------------------------------------------------
 
 static char g_renodx_ver[48] = "not found";
 static bool g_renodx_lazy    = false;
+static bool g_renodx_v46     = false;
 
 // Set when the game's device (or the process) is being destroyed: from that moment,
 // never call back into NGX. The DLSS 5 add-on tears its hooks down during device
@@ -160,6 +165,21 @@ static bool g_renodx_lazy    = false;
 // on a foreign thread and wedges the quitting game (seen in DOOM: 0xE06D7363 in
 // KERNELBASE 18 ms after the add-on's vtable::Unhook). The OS reclaims it all anyway.
 static bool g_ngx_dying = false;
+
+// Write a RenoDX.DLSS5 config default, only when the user has not set the key
+// themselves (the add-on persists any overlay change, and a saved value wins here).
+static void RenodxDefault(const char *key, const char *value, const char *why)
+{
+    char v[16];
+    size_t n = sizeof(v);
+    if (!reshade::get_config_value(nullptr, "RenoDX.DLSS5", key, v, &n))
+    {
+        reshade::set_config_value(nullptr, "RenoDX.DLSS5", key, value);
+        Log("[feed] %s was unset; wrote %s=%s (%s)", key, key, value, why);
+    }
+    else
+        Log("[feed] %s=%s (user-set; leaving it alone)", key, v);
+}
 
 static void DetectRenodxAddon()
 {
@@ -178,10 +198,15 @@ static void DetectRenodxAddon()
     DWORD got = 0;
     char *buf = (size > 0 && size < 8u * 1024 * 1024) ? static_cast<char *>(malloc(size)) : nullptr;
     if (buf != nullptr && ReadFile(f, buf, size, &got, nullptr) && got == size)
-        for (DWORD i = 0; i + 11 < size; ++i)
-            if (memcmp(buf + i, "EnableHooks", 11) == 0) { g_renodx_lazy = true; break; }
+        for (DWORD i = 0; i + 11 < size; ++i)   // both markers happen to be 11 bytes
+        {
+            if (!g_renodx_lazy && memcmp(buf + i, "EnableHooks", 11) == 0) g_renodx_lazy = true;
+            if (!g_renodx_v46  && memcmp(buf + i, "NRToggleKey", 11) == 0) g_renodx_v46  = true;
+            if (g_renodx_lazy && g_renodx_v46) break;
+        }
     free(buf);
     CloseHandle(f);
+    if (g_renodx_v46) g_renodx_lazy = true;   // v4.6 is a per-present-rescan engine too
 
     DWORD dummy = 0;
     const DWORD vsize = GetFileVersionInfoSizeA(path, &dummy);
@@ -198,22 +223,23 @@ static void DetectRenodxAddon()
     }
 
     Log("[feed] DLSS 5 add-on: renodx-dlss5.addon64 v%s -- %s engine", g_renodx_ver,
-        g_renodx_lazy ? "v45+ (per-present rescan, lazy feature adoption; warm-up re-create skipped)"
+        g_renodx_v46  ? "v4.6+ (per-present rescan, lazy adoption, global hotkeys, upscaling latch)"
+      : g_renodx_lazy ? "v45+ (per-present rescan, lazy feature adoption; warm-up re-create skipped)"
                       : "classic (single hook pass; warm-up re-create stays on)");
 
     if (g_renodx_lazy)
-    {
-        // Write EnableHooks=2 only when the user has not set it themselves.
-        char v[16];
-        size_t n = sizeof(v);
-        if (!reshade::get_config_value(nullptr, "RenoDX.DLSS5", "EnableHooks", v, &n))
-        {
-            reshade::set_config_value(nullptr, "RenoDX.DLSS5", "EnableHooks", "2");
-            Log("[feed] EnableHooks was unset; wrote EnableHooks=2 (NGX-only -- this feeder calls NGX directly, no Streamline)");
-        }
-        else
-            Log("[feed] EnableHooks=%s (user-set; leaving it alone)", v);
-    }
+        RenodxDefault("EnableHooks", "2", "NGX-only -- this feeder calls NGX directly, no Streamline");
+
+    // Every known add-on generation reads these two keys; make a fresh install
+    // deterministic. NeuralUplift on is the whole point of installing this feeder.
+    // NREnableUpscaling off matches the contract: this feeder always publishes 1:1
+    // DLAA (even below 100% work resolution -- DLSS runs at the reduced size and the
+    // feeder scales the result back itself), so upscaling could never engage, and
+    // v4.6 pairs its WIP upscaling path with a rejection latch that parks NR on the
+    // native path for the rest of the run. A build too old to know a key never reads
+    // it, so both writes are inert on older generations.
+    RenodxDefault("NeuralUplift", "1", "neural rendering on");
+    RenodxDefault("NREnableUpscaling", "0", "upscaling off; this feeder publishes a complete 1:1 DLAA contract");
 }
 // ---------------------------------------------------------------------------
 // Alex's Toolkit (alexs-toolkit.addon64) -- a third-party NGX interposer that sits
@@ -3861,7 +3887,8 @@ static void DrawOverlay(reshade::api::effect_runtime *rt)
     ImGui::Text("Session: %s", g.disabled ? "disabled (see dlss5-feed.log)" : g.session_ready ? "open" : "not started");
     ImGui::Text("Feature: %s", g.frame_ready ? "ready" : "not built");
     if (g.frames_done > 0) ImGui::Text("Frames delivered: %llu", static_cast<unsigned long long>(g.frames_done));
-    ImGui::Text("DLSS 5 add-on: v%s (%s)", g_renodx_ver, g_renodx_lazy ? "v45+ engine" : "classic engine");
+    ImGui::Text("DLSS 5 add-on: v%s (%s)", g_renodx_ver,
+                g_renodx_v46 ? "v4.6+ engine" : g_renodx_lazy ? "v45+ engine" : "classic engine");
     if (g_toolkit_passes >= 2)
         ImGui::TextColored(ImVec4(1.0f, 0.75f, 0.3f, 1.0f),
                            "Alex's Toolkit %s: %d-pass cascade -- ~%dx temporal history (smearing, slow settle)",

@@ -42,13 +42,31 @@
 static char g_log_path[MAX_PATH];
 static bool g_show_window = false;   // visible host window = the user's door to the DLSS 5 panel
 static bool g_renodx_lazy = false;   // DLSS 5 add-on is v45+ (per-present rescan, lazy adoption)
+static bool g_renodx_v46  = false;   // DLSS 5 add-on is v4.6+ (global hotkeys, upscaling latch)
 
 static void Log(const char *fmt, ...);
+
+// Write a RenoDX.DLSS5 key into the host's ReShade.ini, only when the user has not
+// set it themselves (the add-on persists any overlay change, and a saved value wins).
+static void HostRenodxDefault(const char *ini, const char *key, const char *value, const char *why)
+{
+    char v[16] = {};
+    GetPrivateProfileStringA("RenoDX.DLSS5", key, "", v, sizeof(v), ini);
+    if (v[0] == '\0')
+    {
+        WritePrivateProfileStringA("RenoDX.DLSS5", key, value, ini);
+        Log("[host] %s was unset; wrote %s=%s into the host's ReShade.ini (%s)", key, key, value, why);
+    }
+    else
+        Log("[host] %s=%s (user-set; leaving it alone)", key, v);
+}
 
 // Detect the DLSS 5 add-on generation next to this exe: v45+ ('EnableHooks' marker in
 // the binary) rescans every present and adopts missed features lazily, so the warm-up
 // re-create is unnecessary -- and its EnableHooks key should be '2' (NGX-only) for this
 // feeder, written into OUR ReShade.ini before ReShade loads and the add-on reads it.
+// v4.6+ ('NRToggleKey' marker) keeps that engine and adds two GetAsyncKeyState-polled
+// global hotkeys, which this background helper must unbind (see below).
 static void DetectRenodxAddon()
 {
     char dir[MAX_PATH], path[MAX_PATH], ini[MAX_PATH];
@@ -63,10 +81,15 @@ static void DetectRenodxAddon()
     DWORD got = 0;
     char *buf = (size > 0 && size < 8u * 1024 * 1024) ? static_cast<char *>(malloc(size)) : nullptr;
     if (buf != nullptr && ReadFile(f, buf, size, &got, nullptr) && got == size)
-        for (DWORD i = 0; i + 11 < size; ++i)
-            if (memcmp(buf + i, "EnableHooks", 11) == 0) { g_renodx_lazy = true; break; }
+        for (DWORD i = 0; i + 11 < size; ++i)   // both markers happen to be 11 bytes
+        {
+            if (!g_renodx_lazy && memcmp(buf + i, "EnableHooks", 11) == 0) g_renodx_lazy = true;
+            if (!g_renodx_v46  && memcmp(buf + i, "NRToggleKey", 11) == 0) g_renodx_v46  = true;
+            if (g_renodx_lazy && g_renodx_v46) break;
+        }
     free(buf);
     CloseHandle(f);
+    if (g_renodx_v46) g_renodx_lazy = true;   // v4.6 is a per-present-rescan engine too
 
     char ver[48] = "?";
     DWORD dummy = 0;
@@ -83,19 +106,28 @@ static void DetectRenodxAddon()
         free(vdata);
     }
     Log("[host] DLSS 5 add-on: v%s -- %s engine", ver,
-        g_renodx_lazy ? "v45+ (lazy adoption; warm-up skipped)" : "classic (warm-up stays on)");
+        g_renodx_v46  ? "v4.6+ (lazy adoption, global hotkeys, upscaling latch)"
+      : g_renodx_lazy ? "v45+ (lazy adoption; warm-up skipped)" : "classic (warm-up stays on)");
 
     if (g_renodx_lazy)
+        HostRenodxDefault(ini, "EnableHooks", "2", "NGX-only -- this host calls NGX directly, no Streamline");
+
+    // Every known add-on generation reads these two keys; make a fresh install
+    // deterministic (NeuralUplift on is the whole point; upscaling can never engage
+    // against the 1:1 DLAA contract this host publishes, and v4.6 pairs its WIP
+    // upscaling path with a rejection latch that parks NR on the native path).
+    HostRenodxDefault(ini, "NeuralUplift", "1", "neural rendering on");
+    HostRenodxDefault(ini, "NREnableUpscaling", "0", "upscaling off; this host publishes a complete 1:1 DLAA contract");
+
+    if (g_renodx_v46)
     {
-        char v[16] = {};
-        GetPrivateProfileStringA("RenoDX.DLSS5", "EnableHooks", "", v, sizeof(v), ini);
-        if (v[0] == '\0')
-        {
-            WritePrivateProfileStringA("RenoDX.DLSS5", "EnableHooks", "2", ini);
-            Log("[host] EnableHooks was unset; wrote EnableHooks=2 into the host's ReShade.ini");
-        }
-        else
-            Log("[host] EnableHooks=%s (user-set; leaving it alone)", v);
+        // v4.6 polls its NR-toggle and screenshot hotkeys with GetAsyncKeyState, which
+        // sees keys pressed in the game's window too. This helper usually runs headless,
+        // so a gameplay keypress (F5 is a common quicksave key) would silently toggle NR
+        // off, or fire GPU-readback screenshots, in a process with no visible feedback.
+        // Unbind both unless the user bound them deliberately.
+        HostRenodxDefault(ini, "NRToggleKey", "0", "unbound; gameplay keys must not reach this background helper");
+        HostRenodxDefault(ini, "NRScreenshotKey", "0", "unbound; same reason");
     }
 }
 

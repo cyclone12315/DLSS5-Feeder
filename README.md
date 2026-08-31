@@ -25,6 +25,16 @@
 > Running a newer build alongside DLSS5-Feeder conflicts. **Use v4.55**, from the same RenoDX
 > Discord, `#DLSS5` channel:
 > <https://discord.com/channels/1408098019194310818/1542647972695904317/1543568908017995818>
+>
+> **v4.6 status (2026-08-31):** building from current `main` adds v4.6 support. The feeder
+> detects a v4.6 build (`NRToggleKey` marker), keeps the lazy-adoption path, writes
+> `EnableHooks=2`, `NeuralUplift=1` and `NREnableUpscaling=0` when unset (v4.6 pairs its WIP
+> upscaling with a rejection latch, and this feeder's contract is always 1:1 DLAA), and in the
+> `host64` helper unbinds v4.6's new global hotkeys so a gameplay keypress cannot silently
+> toggle NR in the background process. Older add-on builds are unaffected — every guard is
+> keyed to a marker only newer builds carry, or writes a key only they read. Static analysis
+> shows no remaining conflict, but **no game row has verified a v4.6 run yet** — with the
+> released feeder builds, stay on v4.55.
 
 ## ⚠️ Not compatible with Nvidia Smooth Motion / Optiscaler. Disable them to avoid issues.
 
