@@ -274,11 +274,14 @@ static void CfgWriteDefault()
             "mv_scale_x=%.3f\n"
             "mv_scale_y=%.3f\n"
             "probe=%d\n"
-            "probe_candidate=%d\n",
+            "probe_candidate=%d\n"
+            "probe_capture_occurrence=%d\n",
             g_cfg.enabled, g_cfg.mode, g_cfg.hdr, g_cfg.depth_inverted, g_cfg.flags, g_cfg.reset_every,
             g_cfg.warmup_rebuild, g_cfg.rebuild, g_cfg.log_frames, g_cfg.create_delay, g_cfg.preset,
             g_cfg.work_resolution, g_cfg.mv_scale_x, g_cfg.mv_scale_y,
-            probe::g_enabled, probe::g_candidate);
+            probe::g_enabled.load(std::memory_order_relaxed),
+            probe::g_candidate.load(std::memory_order_relaxed),
+            probe::g_capture_occurrence.load(std::memory_order_relaxed));
     fclose(f);
     Log("[feed] wrote default config to %s", path);
 }
@@ -313,8 +316,10 @@ static bool CfgReload()
         else if (_stricmp(key, "work_resolution")== 0) next.work_resolution = iv;
         else if (_stricmp(key, "mv_scale_x")     == 0) next.mv_scale_x     = val;
         else if (_stricmp(key, "mv_scale_y")     == 0) next.mv_scale_y     = val;
-        else if (_stricmp(key, "probe")          == 0) probe::g_enabled    = iv ? 1 : 0;
-        else if (_stricmp(key, "probe_candidate")== 0) probe::g_candidate  = iv;
+        else if (_stricmp(key, "probe")          == 0) probe::g_enabled.store(iv ? 1 : 0, std::memory_order_relaxed);
+        else if (_stricmp(key, "probe_candidate")== 0) probe::g_candidate.store(iv, std::memory_order_relaxed);
+        else if (_stricmp(key, "probe_capture_occurrence") == 0)
+            probe::g_capture_occurrence.store(iv > 0 ? iv : 1, std::memory_order_relaxed);
     }
     fclose(f);
     if (next.mode < 0 || next.mode > 2) next.mode = g_cfg.mode;
@@ -346,11 +351,13 @@ static void CfgSave()
     fprintf(f,
         "enabled=%d\nmode=%d\nhdr=%d\ndepth_inverted=%d\nflags=%d\nreset_every=%d\nwarmup_rebuild=%d\n"
             "rebuild=%d\nlog_frames=%d\ncreate_delay=%d\npreset=%d\nwork_resolution=%d\nmv_scale_x=%.3f\nmv_scale_y=%.3f\n"
-            "probe=%d\nprobe_candidate=%d\n",
+            "probe=%d\nprobe_candidate=%d\nprobe_capture_occurrence=%d\n",
             g_cfg.enabled, g_cfg.mode, g_cfg.hdr, g_cfg.depth_inverted, g_cfg.flags, g_cfg.reset_every,
             g_cfg.warmup_rebuild, g_cfg.rebuild, g_cfg.log_frames, g_cfg.create_delay, g_cfg.preset,
             g_cfg.work_resolution, g_cfg.mv_scale_x, g_cfg.mv_scale_y,
-            probe::g_enabled, probe::g_candidate);
+            probe::g_enabled.load(std::memory_order_relaxed),
+            probe::g_candidate.load(std::memory_order_relaxed),
+            probe::g_capture_occurrence.load(std::memory_order_relaxed));
     fclose(f);
 }
 
@@ -3755,11 +3762,8 @@ static void OnRenderTechnique(reshade::api::effect_runtime *rt, reshade::api::ef
 {
     // The texture probe runs outside the DLSS contract: it must fire even when the
     // DLSS5_Feed.fx technique is missing, and it owns the frame while enabled.
-    if (probe::g_enabled)
-    {
-        probe::OnRenderTechniqueTick(rt, cl, rtv);
+    if (probe::g_enabled.load(std::memory_order_relaxed) != 0)
         return;
-    }
     if (rt != g.runtime || g.technique.handle == 0 || technique.handle != g.technique.handle) return;
     FeedFrame(rt, cl, rtv);
 }
@@ -3955,7 +3959,7 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID)
         probe::g_save_cfg = &CfgSave;   // overlay toggle can persist itself
         probe::ProbeRegisterEvents();   // handlers are no-ops while the "probe" key is 0
         reshade::register_overlay("Eden Vulkan Texture Probe", probe::DrawProbeOverlay);
-        if (probe::g_enabled)
+        if (probe::g_enabled.load(std::memory_order_relaxed) != 0)
             Log("[probe] Vulkan texture discovery enabled (DLSS feed inert; captures go to dlss5-probe\\)");
 
         reshade::register_event<reshade::addon_event::create_device>(OnCreateDevice);
