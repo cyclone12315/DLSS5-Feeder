@@ -345,10 +345,12 @@ static void CfgSave()
     if (fopen_s(&f, path, "w") != 0 || f == nullptr) return;
     fprintf(f,
         "enabled=%d\nmode=%d\nhdr=%d\ndepth_inverted=%d\nflags=%d\nreset_every=%d\nwarmup_rebuild=%d\n"
-            "rebuild=%d\nlog_frames=%d\ncreate_delay=%d\npreset=%d\nwork_resolution=%d\nmv_scale_x=%.3f\nmv_scale_y=%.3f\n",
+            "rebuild=%d\nlog_frames=%d\ncreate_delay=%d\npreset=%d\nwork_resolution=%d\nmv_scale_x=%.3f\nmv_scale_y=%.3f\n"
+            "probe=%d\nprobe_candidate=%d\n",
             g_cfg.enabled, g_cfg.mode, g_cfg.hdr, g_cfg.depth_inverted, g_cfg.flags, g_cfg.reset_every,
             g_cfg.warmup_rebuild, g_cfg.rebuild, g_cfg.log_frames, g_cfg.create_delay, g_cfg.preset,
-            g_cfg.work_resolution, g_cfg.mv_scale_x, g_cfg.mv_scale_y);
+            g_cfg.work_resolution, g_cfg.mv_scale_x, g_cfg.mv_scale_y,
+            probe::g_enabled, probe::g_candidate);
     fclose(f);
 }
 
@@ -3950,6 +3952,7 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID)
         CfgReload();
         DetectRenodxAddon();
 
+        probe::g_save_cfg = &CfgSave;   // overlay toggle can persist itself
         probe::ProbeRegisterEvents();   // handlers are no-ops while the "probe" key is 0
         reshade::register_overlay("Eden Vulkan Texture Probe", probe::DrawProbeOverlay);
         if (probe::g_enabled)
