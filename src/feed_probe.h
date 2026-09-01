@@ -63,6 +63,8 @@ struct TexInfo
     // Per-frame (reset on present)
     uint32_t fr_draws = 0, fr_rt_binds = 0;
     bool     fr_depth = false, fr_feeds_swapchain = false, fr_copy_to = false;
+    bool     fr_had_depth = false;            // this COLOR target was bound while a DSV was active
+    uint64_t fr_depth_resource = 0;           // the simultaneously-bound depth-stencil resource
     uint32_t fr_vp_w = 0, fr_vp_h = 0;
     uint64_t fr_first_event = 0, fr_last_event = 0;
     bool     fr_active = false;
@@ -71,11 +73,11 @@ struct TexInfo
     uint32_t score = 0;
 };
 
-struct ActiveRt  // per command list
+struct ActiveRt  // per command list; REPLACED on every full binding operation
 {
     uint64_t rt_res[4] = {};
     uint32_t rt_count = 0;
-    bool     depth = false;
+    uint64_t dsv_res = 0;
 };
 
 static SRWLOCK                       g_lock = SRWLOCK_INIT;
@@ -95,7 +97,11 @@ struct Snapshot
     uint32_t w = 0, h = 0;
     unsigned fmt = 0;
     uint32_t draws = 0, binds = 0, score = 0;
-    bool     depth = false, feeds = false;
+    bool     had_depth = false, feeds = false;
+    uint64_t depth_handle = 0;
+    uint32_t depth_w = 0, depth_h = 0;
+    unsigned depth_fmt = 0;
+    uint32_t vp_w = 0, vp_h = 0;
     uint64_t first = 0, last = 0;
     uint32_t layers = 0, samples = 0;
 };
@@ -232,30 +238,45 @@ static void OnResourceViewInit(reshade::api::device *device, reshade::api::resou
     ReleaseSRWLockExclusive(&g_lock);
 }
 
-static void TouchActive(reshade::api::command_list *cmd_list, uint64_t res_handle, bool depth)
+// Replace the active attachment set of this command list. Called on every complete
+// render-target binding operation (bind_render_targets_and_depth_stencil and
+// begin_render_pass) -- the new set REPLACES whatever was active before, otherwise
+// draws get attributed to every RT ever bound on this list (the contamination that
+// made several 2496x1404 candidates report identical draw counts).
+static void SetActiveAttachments(reshade::api::command_list *cmd_list, const uint64_t *rt_res, uint32_t n, uint64_t dsv_res)
 {
-    // Caller holds no lock; we take it. Records the binding and the event order.
     AcquireSRWLockExclusive(&g_lock);
     ActiveRt &a = g_active[cmd_list->get_native()];
-    if (!depth)
+    a.rt_count = (n < 4) ? n : 4;
+    for (uint32_t i = 0; i < a.rt_count; ++i) a.rt_res[i] = rt_res[i];
+    a.dsv_res = dsv_res;
+    if (g_seq == 0) g_seq = 1;
+    for (uint32_t i = 0; i < a.rt_count; ++i)
+        if (TexInfo *t = FindTex(a.rt_res[i]))
+        {
+            t->ever_rt = true;
+            t->last_usage = reshade::api::resource_usage::render_target;
+            t->fr_rt_binds++;
+            t->fr_active = true;
+            if (t->fr_first_event == 0) t->fr_first_event = g_seq;
+            t->fr_last_event = g_seq;
+        }
+    if (TexInfo *d = FindTex(dsv_res))
     {
-        bool already = false;
-        for (uint32_t i = 0; i < a.rt_count; ++i) already |= (a.rt_res[i] == res_handle);
-        if (!already && a.rt_count < 4) a.rt_res[a.rt_count++] = res_handle;
+        d->ever_depth = true;
+        d->last_usage = reshade::api::resource_usage::depth_stencil;
+        d->fr_active = true;
+        d->fr_depth = true;
+        if (d->fr_first_event == 0) d->fr_first_event = g_seq;
+        d->fr_last_event = g_seq;
     }
-    a.depth |= depth;
+    ReleaseSRWLockExclusive(&g_lock);
+}
 
-    if (TexInfo *t = FindTex(res_handle))
-    {
-        if (g_seq == 0) g_seq = 1;
-        if (t->fr_first_event == 0) t->fr_first_event = g_seq;
-        t->fr_last_event = g_seq;
-        t->fr_active = true;
-        if (depth) { t->fr_depth = true; t->ever_depth = true; }
-        else       { t->fr_rt_binds++;  t->ever_rt = true;    }
-        t->last_usage = depth ? reshade::api::resource_usage::depth_stencil
-                              : reshade::api::resource_usage::render_target;
-    }
+static void ClearActiveAttachments(reshade::api::command_list *cmd_list)
+{
+    AcquireSRWLockExclusive(&g_lock);
+    g_active.erase(cmd_list->get_native());
     ReleaseSRWLockExclusive(&g_lock);
 }
 
@@ -265,17 +286,21 @@ static void OnBindRenderTargets(reshade::api::command_list *cmd_list, uint32_t c
     if (!g_enabled || g_device == nullptr)
         return;
     g_seq++;
-    for (uint32_t i = 0; i < count && i < 8; ++i)
+    uint64_t rt_res[4] = {};
+    uint32_t n = 0;
+    for (uint32_t i = 0; i < count && i < 8 && n < 4; ++i)
     {
         if (rtvs[i].handle == 0) continue;
         const reshade::api::resource res = g_device->get_resource_from_view(rtvs[i]);
-        if (res.handle != 0) TouchActive(cmd_list, res.handle, false);
+        if (res.handle != 0) rt_res[n++] = res.handle;
     }
+    uint64_t dsv_res = 0;
     if (dsv.handle != 0)
     {
         const reshade::api::resource res = g_device->get_resource_from_view(dsv);
-        if (res.handle != 0) TouchActive(cmd_list, res.handle, true);
+        if (res.handle != 0) dsv_res = res.handle;
     }
+    SetActiveAttachments(cmd_list, rt_res, n, dsv_res);
 }
 
 static bool OnBeginRenderPass(reshade::api::command_list *cmd_list, uint32_t count,
@@ -285,24 +310,29 @@ static bool OnBeginRenderPass(reshade::api::command_list *cmd_list, uint32_t cou
     if (!g_enabled)
         return false;
     g_seq++;
-    for (uint32_t i = 0; i < count && i < 8; ++i)
+    uint64_t rt_res[4] = {};
+    uint32_t n = 0;
+    for (uint32_t i = 0; i < count && i < 8 && n < 4; ++i)
     {
         if (rts[i].view.handle == 0 || g_device == nullptr) continue;
         const reshade::api::resource res = g_device->get_resource_from_view(rts[i].view);
-        if (res.handle != 0) TouchActive(cmd_list, res.handle, false);
+        if (res.handle != 0) rt_res[n++] = res.handle;
     }
+    uint64_t dsv_res = 0;
     if (ds != nullptr && ds->view.handle != 0 && g_device != nullptr)
     {
         const reshade::api::resource res = g_device->get_resource_from_view(ds->view);
-        if (res.handle != 0) TouchActive(cmd_list, res.handle, true);
+        if (res.handle != 0) dsv_res = res.handle;
     }
+    SetActiveAttachments(cmd_list, rt_res, n, dsv_res); // a render pass establishes a NEW attachment set
     return false;
 }
 
-static bool OnEndRenderPass(reshade::api::command_list *)
+static bool OnEndRenderPass(reshade::api::command_list *cmd_list)
 {
     if (!g_enabled) return false;
     g_seq++;
+    ClearActiveAttachments(cmd_list);
     return false;
 }
 
@@ -322,6 +352,13 @@ static void RecordDraw(reshade::api::command_list *cmd_list, uint32_t n)
                 t->total_draws += n;
                 if (t->fr_first_event == 0) t->fr_first_event = g_seq;
                 t->fr_last_event = g_seq;
+                // Color <-> depth association: was a depth-stencil resource bound
+                // alongside this COLOR target while it was being drawn into?
+                if (it->second.dsv_res != 0)
+                {
+                    t->fr_had_depth = true;
+                    t->fr_depth_resource = it->second.dsv_res;
+                }
             }
     }
     ReleaseSRWLockExclusive(&g_lock);
@@ -435,7 +472,7 @@ static uint32_t ScoreTex(const TexInfo &t, uint32_t swapchain_area)
     else if (t.fr_draws >= 100) s += 20;
     else if (t.fr_draws >= 20) s += 10;
     else if (t.fr_draws > 0) s += 5;
-    if (t.fr_depth) s += 15;
+    if (t.fr_had_depth) s += 15; // COLOR target drawn with a live depth attachment: strong 3D-scene signal
     if (t.fr_vp_w != 0 && t.w != 0 &&
         t.fr_vp_w >= (t.w >> 1) && t.fr_vp_w <= t.w * 2 &&
         t.fr_vp_h >= (t.h >> 1) && t.fr_vp_h <= t.h * 2) s += 10;
@@ -504,7 +541,11 @@ static void FinalizeFrame()
             Snapshot s;
             s.handle = best_h; s.w = t.w; s.h = t.h; s.fmt = t.fmt;
             s.draws = t.fr_draws; s.binds = t.fr_rt_binds; s.score = t.score;
-            s.depth = t.fr_depth; s.feeds = t.fr_feeds_swapchain;
+            s.had_depth = t.fr_had_depth; s.feeds = t.fr_feeds_swapchain;
+            s.depth_handle = t.fr_depth_resource;
+            if (const TexInfo *d = FindTex(t.fr_depth_resource))
+            { s.depth_w = d->w; s.depth_h = d->h; s.depth_fmt = d->fmt; }
+            s.vp_w = t.fr_vp_w; s.vp_h = t.fr_vp_h;
             s.first = t.fr_first_event; s.last = t.fr_last_event;
             s.layers = t.layers; s.samples = t.samples;
             g_top.push_back(s);
@@ -520,8 +561,8 @@ static void FinalizeFrame()
         if (!g_top.empty())
         {
             const Snapshot &t = g_top[0];
-            Log("[probe] frame %llu: tracked=%u active=%u | top: %ux%u %s draws=%u depth=%d feeds_swapchain=%d score=%u",
-                (unsigned long long)g_frame, alive, active, t.w, t.h, FmtName(t.fmt), t.draws, int(t.depth), int(t.feeds), t.score);
+            Log("[probe] frame %llu: tracked=%u active=%u | top: %ux%u %s draws=%u had_depth=%d feeds_swapchain=%d score=%u",
+                (unsigned long long)g_frame, alive, active, t.w, t.h, FmtName(t.fmt), t.draws, int(t.had_depth), int(t.feeds), t.score);
         }
         else
             Log("[probe] frame %llu: tracked=%u active=%u | no candidates this frame", (unsigned long long)g_frame, alive, active);
@@ -535,6 +576,8 @@ static void FinalizeFrame()
         TexInfo &t = kv.second;
         t.fr_draws = t.fr_rt_binds = 0;
         t.fr_depth = t.fr_feeds_swapchain = t.fr_copy_to = false;
+        t.fr_had_depth = false;
+        t.fr_depth_resource = 0;
         t.fr_vp_w = t.fr_vp_h = 0;
         t.fr_first_event = t.fr_last_event = 0;
         t.fr_active = false;
@@ -628,8 +671,15 @@ static void CaptureAndSave(reshade::api::effect_runtime *rt, reshade::api::comma
     reshade::api::command_queue *queue = rt->get_command_queue();
     queue->flush_immediate_command_list();
     const uint64_t v = ++g_capture_fence_value;
-    queue->signal(g_capture_fence, v);
-    queue->wait(g_capture_fence, v); // CPU-blocking; acceptable for a manual debug capture
+    queue->signal(g_capture_fence, v);       // GPU-side: signals after prior work (the copy) finishes
+    // CPU-blocking wait (device::wait, not command_queue::wait -- the latter only
+    // enqueues a GPU-side wait and returns immediately). Mapping before the copy
+    // has actually completed would yield garbage or torn data.
+    if (!g_device->wait(g_capture_fence, v))
+    {
+        Log("[probe] capture failed: fence wait timed out");
+        return;
+    }
 
     void *mapped = nullptr;
     if (!g_device->map_buffer_region(g_capture_buffer, 0, buf_size, reshade::api::map_access::read_only, &mapped) || mapped == nullptr)
@@ -740,8 +790,9 @@ static void CaptureAndSave(reshade::api::effect_runtime *rt, reshade::api::comma
                 (unsigned long long)g_capture_handle, fmt.name, unsigned(desc.texture.format), w, h,
                 desc.texture.depth_or_layers, desc.texture.samples, (unsigned long long)g_frame);
         if (t != nullptr)
-            fprintf(fp, "score=%u\ndraws_this_frame=%u\nrt_binds=%u\ndepth=%d\nfeeds_swapchain=%d\nevent_first=%llu\nevent_last=%llu\nframes_seen=%u\ntotal_draws=%llu\n",
-                    t->score, t->fr_draws, t->fr_rt_binds, int(t->fr_depth), int(t->fr_feeds_swapchain),
+            fprintf(fp, "score=%u\ndraws_this_frame=%u\nrt_binds=%u\nhad_depth=%d\ndepth_resource=0x%016llX\nviewport=%ux%u\nevent_first=%llu\nevent_last=%llu\nframes_seen=%u\ntotal_draws=%llu\n",
+                    t->score, t->fr_draws, t->fr_rt_binds, int(t->fr_had_depth),
+                    (unsigned long long)t->fr_depth_resource, t->fr_vp_w, t->fr_vp_h,
                     (unsigned long long)t->fr_first_event, (unsigned long long)t->fr_last_event,
                     t->frames_seen, (unsigned long long)t->total_draws);
         fprintf(fp, "copy_edges_this_frame=%zu\n", g_edges.size());
@@ -817,10 +868,14 @@ static void DrawProbeOverlay(reshade::api::effect_runtime * /*runtime*/)
         char label[32]; snprintf(label, sizeof(label), "#%u", unsigned(i + 1));
         ImGui::BeginGroup();
         ImGui::Text("%s %s 0x%016llX", label, (int(i + 1) == g_candidate) ? ">" : " ", (unsigned long long)s.handle);
-        ImGui::Text("  %ux%u %s layers=%u samples=%u", s.w, s.h, FmtName(s.fmt), s.layers, s.samples);
-        ImGui::Text("  draws=%u binds=%u depth=%d first=%llu last=%llu", s.draws, s.binds, int(s.depth),
+        ImGui::Text("  %ux%u %s layers=%u samples=%u viewport=%ux%u", s.w, s.h, FmtName(s.fmt), s.layers, s.samples, s.vp_w, s.vp_h);
+        ImGui::Text("  draws=%u binds=%u first=%llu last=%llu", s.draws, s.binds,
                     (unsigned long long)s.first, (unsigned long long)s.last);
-        ImGui::Text("  feeds_swapchain=%s score=%u", s.feeds ? "yes" : "no", s.score);
+        if (s.had_depth && s.depth_handle != 0)
+            ImGui::Text("  depth: 0x%016llX (%ux%u %s)", (unsigned long long)s.depth_handle, s.depth_w, s.depth_h, FmtName(s.depth_fmt));
+        else
+            ImGui::TextDisabled("  depth: none");
+        ImGui::Text("  copy-graph-feeds-swapchain=%s (informational only) score=%u", s.feeds ? "yes" : "no", s.score);
         ImGui::EndGroup();
         ImGui::Separator();
     }
