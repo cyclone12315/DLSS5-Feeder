@@ -3808,7 +3808,8 @@ static void DrawOverlay(reshade::api::effect_runtime *rt)
     static const char *kModes[] = { "Inert", "Transport test (no NGX)", "Full DLSS path" };
     if (ImGui::Combo("Mode", &g_cfg.mode, kModes, 3)) dirty = true;
     const bool adjustable_work_resolution = rt != nullptr &&
-        rt->get_device()->get_api() == reshade::api::device_api::d3d11;
+        (rt->get_device()->get_api() == reshade::api::device_api::d3d11 ||
+         rt->get_device()->get_api() == reshade::api::device_api::vulkan);
     if (adjustable_work_resolution)
     {
         if (g_pending_work_resolution == 0 && g_work_resolution_ui != g_cfg.work_resolution)
@@ -3828,7 +3829,7 @@ static void DrawOverlay(reshade::api::effect_runtime *rt)
     }
     else
     {
-        ImGui::TextDisabled("Work resolution: 100%% (adjustable path currently supports 64-bit D3D11)");
+        ImGui::TextDisabled("Work resolution: 100%% (adjustable path currently supports 64-bit D3D11 and Vulkan)");
     }
     static const char *kTri[] = { "Auto", "Force off", "Force on" };
     int hdr_idx = g_cfg.hdr + 1, di_idx = g_cfg.depth_inverted + 1;
