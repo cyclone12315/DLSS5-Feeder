@@ -1,0 +1,83 @@
+name: build-and-commit
+
+# Temporary helper: fetch the built 64-bit add-on through git (this developer's
+# network cannot reach GitHub artifact blob storage). Builds on the runner and
+# commits the binary into the branch under dist/. dist/ commits are ignored to
+# avoid a trigger loop.
+on:
+  push:
+    branches: [vulkan-work-res-poc]
+    paths-ignore:
+      - 'dist/**'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-2022
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve dependency revisions
+        id: deps
+        shell: bash
+        run: |
+          set -euo pipefail
+          ngx=$(git ls-remote https://github.com/NVIDIA/DLSS.git HEAD | cut -f1)
+          vk=$(git ls-remote https://github.com/KhronosGroup/Vulkan-Headers.git HEAD | cut -f1)
+          echo "ngx=$ngx" >> "$GITHUB_OUTPUT"
+          echo "vk=$vk" >> "$GITHUB_OUTPUT"
+
+      - name: Cache external headers
+        id: cache-external
+        uses: actions/cache@v4
+        with:
+          path: |
+            external/ngx
+            external/vulkan
+          key: external-v2-${{ runner.os }}-ngx-${{ steps.deps.outputs.ngx }}-vk-${{ steps.deps.outputs.vk }}
+
+      - name: Fetch the NGX SDK
+        if: steps.cache-external.outputs.cache-hit != 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          git clone --filter=blob:none --no-checkout --depth 1 \
+              https://github.com/NVIDIA/DLSS.git "$RUNNER_TEMP/dlss"
+          git -C "$RUNNER_TEMP/dlss" sparse-checkout set --no-cone '/include/**' '/lib/**'
+          git -C "$RUNNER_TEMP/dlss" checkout
+          mkdir -p external/ngx/libs
+          find "$RUNNER_TEMP/dlss" -name 'nvsdk_ngx*.h' -exec cp {} external/ngx/ ';'
+          cp "$RUNNER_TEMP/dlss/lib/Windows_x86_64/x64/nvsdk_ngx_d.lib" external/ngx/libs/
+
+      - name: Fetch the Vulkan headers
+        if: steps.cache-external.outputs.cache-hit != 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          git clone --depth 1 https://github.com/KhronosGroup/Vulkan-Headers.git "$RUNNER_TEMP/vkh"
+          mkdir -p external/vulkan/vulkan external/vulkan/vk_video
+          cp "$RUNNER_TEMP/vkh"/include/vulkan/*.h   external/vulkan/vulkan/
+          cp "$RUNNER_TEMP/vkh"/include/vk_video/*.h external/vulkan/vk_video/
+
+      - name: Build addon64
+        shell: cmd
+        run: call build.bat
+
+      - name: Commit the binary into the branch
+        shell: bash
+        run: |
+          set -euo pipefail
+          ls -l build
+          mkdir -p dist
+          cp build/dlss5-feed.addon64 dist/dlss5-feed.addon64.ci
+          sha256sum dist/dlss5-feed.addon64.ci
+          git config user.name "ci-builder"
+          git config user.email "noreply@github.com"
+          git add dist
+          git diff --cached --quiet && { echo "unchanged"; exit 0; }
+          git commit -m "dist: CI-built dlss5-feed.addon64"
+          git push
