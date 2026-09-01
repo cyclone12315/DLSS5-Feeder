@@ -190,17 +190,21 @@ static void FeedVkCopyImage(FeedVk *vk, VkCommandBuffer cb, VkImage src, VkImage
     vk->CmdCopyImage(cb, src, src_layout, dst, dst_layout, 1, &c);
 }
 
-// Blit our output (GENERAL) -> game backbuffer (in dst_layout): handles a format /
-// channel-order difference that a raw copy cannot.
+// Blit between our images and the game's (both sides left in layouts that are valid
+// blit layouts): handles a format / channel-order / SIZE difference that a raw copy
+// cannot. Equal sizes + VK_FILTER_NEAREST reproduce the old behaviour exactly; the
+// work-resolution path uses mismatched extents (native -> work, work -> native) with
+// LINEAR for color and NEAREST for data-like inputs (mv/depth/mask).
 static void FeedVkBlitImage(FeedVk *vk, VkCommandBuffer cb, VkImage src, VkImageLayout src_layout,
-                            VkImage dst, VkImageLayout dst_layout, UINT w, UINT h)
+                            VkImage dst, VkImageLayout dst_layout,
+                            UINT src_w, UINT src_h, UINT dst_w, UINT dst_h, VkFilter filter)
 {
     VkImageBlit bl = {};
     bl.srcSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
     bl.dstSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
-    bl.srcOffsets[1]  = { static_cast<int32_t>(w), static_cast<int32_t>(h), 1 };
-    bl.dstOffsets[1]  = { static_cast<int32_t>(w), static_cast<int32_t>(h), 1 };
-    vk->CmdBlitImage(cb, src, src_layout, dst, dst_layout, 1, &bl, VK_FILTER_NEAREST);
+    bl.srcOffsets[1]  = { static_cast<int32_t>(src_w), static_cast<int32_t>(src_h), 1 };
+    bl.dstOffsets[1]  = { static_cast<int32_t>(dst_w), static_cast<int32_t>(dst_h), 1 };
+    vk->CmdBlitImage(cb, src, src_layout, dst, dst_layout, 1, &bl, filter);
 }
 
 // DXGI_FORMAT -> VkFormat for the shared-resource formats this project uses.

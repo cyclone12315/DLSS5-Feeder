@@ -2984,7 +2984,7 @@ static void FeedFrameVk(reshade::api::effect_runtime *rt, reshade::api::command_
                                     bb_img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, w, h);
                 else
                     FeedVkBlitImage(&g.vk, cb, g.vk_img[SLOT_OUTPUT], VK_IMAGE_LAYOUT_GENERAL,
-                                    bb_img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, w, h);
+                                    bb_img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, w, h, w, h, VK_FILTER_NEAREST);
             }
             {
                 const resource       res[1]  = { bb_res };
