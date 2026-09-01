@@ -1,0 +1,44 @@
+name: retrieve-artifact
+
+# Temporary helper: this developer's network cannot reach GitHub's artifact blob
+# storage, but git works. Re-download the artifact of a finished build run and
+# push the 64-bit add-on binary into the branch under dist/ so it can be pulled.
+on:
+  workflow_dispatch:
+    inputs:
+      run_id:
+        description: 'Build run id to fetch the artifact from'
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  retrieve:
+    runs-on: windows-2022
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: vulkan-work-res-poc
+
+      - name: Download the build artifact
+        uses: actions/download-artifact@v4
+        with:
+          run-id: ${{ inputs.run_id }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          path: artifact
+
+      - name: Commit the addon binaries into the branch
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          find artifact -name 'dlss5-feed.addon64' -exec cp {} dist/ \;
+          find artifact -name 'dlss5-feed.addon32' -exec cp {} dist/ \; || true
+          ls -la dist
+          git config user.name "artifact-retriever"
+          git config user.email "noreply@github.com"
+          git add dist
+          git commit -m "dist: CI-built addon binaries from run ${{ inputs.run_id }}"
+          git push
