@@ -233,7 +233,7 @@ struct Cfg
     int   log_frames;      // how many first frames get a full parameter dump in the log
     int   create_delay;    // frames to hold the FIRST feature create (the DLSS 5 add-on arms its NGX hooks asynchronously)
     int   preset;          // DLSS render preset hint: 0 default, 5=E, 6=F (legacy CNN), 10=J, 11=K (transformer)
-    int   work_resolution; // 64-bit D3D11 only: 50..100 percent of each backbuffer axis
+    int   work_resolution; // 64-bit D3D11 and Vulkan: 50..100 percent of each backbuffer axis
     float mv_scale_x;      // multiplier applied to the motion vectors (the FX already outputs pixels)
     float mv_scale_y;
 };
@@ -357,7 +357,7 @@ static bool ApplyPendingWorkResolution()
     if (next == g_cfg.work_resolution) return false;
     g_cfg.work_resolution = next;
     CfgSave();
-    Log("[feed] settled D3D11 work resolution=%d%%; rebuilding private resources", g_cfg.work_resolution);
+    Log("[feed] settled work resolution=%d%%; rebuilding private resources", g_cfg.work_resolution);
     return true;
 }
 
@@ -1915,17 +1915,23 @@ static bool MakeSharedTexVk(int slot, UINT w, UINT h, DXGI_FORMAT fmt, bool uav,
     return true;
 }
 
-static bool BuildResourcesVk(UINT w, UINT h, DXGI_FORMAT bb_fmt)
+// Work and native (backbuffer) dimensions are tracked separately, mirroring the D3D11
+// BuildResources: everything shared and the DLSS feature live at the WORK size, while
+// g.backbuffer_width/height records what the game actually renders into.
+static bool BuildResourcesVk(UINT work_w, UINT work_h, UINT backbuffer_w, UINT backbuffer_h, DXGI_FORMAT bb_fmt)
 {
     if (g.session_ready && g_cfg.mode >= 2 && g.feature != nullptr && g.tex12[SLOT_COLOR] != nullptr &&
-        w == g.width && h == g.height && bb_fmt == g.bb_fmt)
-        return RecreateFeatureOnly(w, h);
+        work_w == g.width && work_h == g.height && backbuffer_w == g.backbuffer_width &&
+        backbuffer_h == g.backbuffer_height && bb_fmt == g.bb_fmt)
+        return RecreateFeatureOnly(work_w, work_h);
 
     Breadcrumb("building the Vulkan-shared textures");
     ReleaseFrameResources();
 
-    g.width      = w;
-    g.height     = h;
+    g.width      = work_w;
+    g.height     = work_h;
+    g.backbuffer_width  = backbuffer_w;
+    g.backbuffer_height = backbuffer_h;
     g.bb_fmt     = bb_fmt;
     g.color_fmt  = TypedColorFormat(bb_fmt);
     g.output_fmt = ResolveOutputFormat(g.color_fmt, g.dev12);
@@ -1947,11 +1953,11 @@ static bool BuildResourcesVk(UINT w, UINT h, DXGI_FORMAT bb_fmt)
     // never has to barrier them there at all.
     const reshade::api::resource_usage copy_rw =
         reshade::api::resource_usage::copy_dest | reshade::api::resource_usage::copy_source;
-    if (!MakeSharedTexVk(SLOT_COLOR,  w, h, g.color_fmt,             false, copy_rw, reshade::api::resource_usage::copy_dest) ||
-        !MakeSharedTexVk(SLOT_OUTPUT, w, h, g.output_fmt,            true,  copy_rw, reshade::api::resource_usage::copy_source) ||
-        !MakeSharedTexVk(SLOT_DEPTH,  w, h, DXGI_FORMAT_R32_FLOAT,   false, copy_rw, reshade::api::resource_usage::copy_dest) ||
-        !MakeSharedTexVk(SLOT_MV,     w, h, DXGI_FORMAT_R16G16_FLOAT, false, copy_rw, reshade::api::resource_usage::copy_dest) ||
-        !MakeSharedTexVk(SLOT_MASK,   w, h, DXGI_FORMAT_R8_UNORM,     false, copy_rw, reshade::api::resource_usage::copy_dest))
+    if (!MakeSharedTexVk(SLOT_COLOR,  work_w, work_h, g.color_fmt,             false, copy_rw, reshade::api::resource_usage::copy_dest) ||
+        !MakeSharedTexVk(SLOT_OUTPUT, work_w, work_h, g.output_fmt,            true,  copy_rw, reshade::api::resource_usage::copy_source) ||
+        !MakeSharedTexVk(SLOT_DEPTH,  work_w, work_h, DXGI_FORMAT_R32_FLOAT,   false, copy_rw, reshade::api::resource_usage::copy_dest) ||
+        !MakeSharedTexVk(SLOT_MV,     work_w, work_h, DXGI_FORMAT_R16G16_FLOAT, false, copy_rw, reshade::api::resource_usage::copy_dest) ||
+        !MakeSharedTexVk(SLOT_MASK,   work_w, work_h, DXGI_FORMAT_R8_UNORM,     false, copy_rw, reshade::api::resource_usage::copy_dest))
     {
         ReleaseFrameResources();
         return false;
@@ -1960,7 +1966,7 @@ static bool BuildResourcesVk(UINT w, UINT h, DXGI_FORMAT bb_fmt)
     if (g_cfg.mode < 2) { g.frame_ready = true; g.need_reset = true; Log("[feed] transport ready (mode %d, no NGX feature)", g_cfg.mode); return true; }
 
     bool crashed = false;
-    if (!CreateDlssFeature(w, h, inverted, &crashed))
+    if (!CreateDlssFeature(work_w, work_h, inverted, &crashed))
     {
         if (crashed) FeedDisable("creating the DLSS feature crashed (the DLSS 5 add-on may be incompatible)");
         return false;
@@ -2803,7 +2809,13 @@ static void FeedFrameVk(reshade::api::effect_runtime *rt, reshade::api::command_
     if (!g.session_ready) ok = InitSessionVk(rt);
 
     const DXGI_FORMAT bbf = static_cast<DXGI_FORMAT>(cd.texture.format);
-    const bool needs_build_vk = !g.frame_ready || w != g.width || h != g.height || bbf != g.bb_fmt;
+    // Work-resolution semantics, mirroring FeedFrame11: g.width/height are the DLSS
+    // working dimensions, g.backbuffer_width/height the native Vulkan target. Rebuild
+    // when either size or the format changes.
+    const UINT work_w = ScaledExtent(w, g_cfg.work_resolution);
+    const UINT work_h = ScaledExtent(h, g_cfg.work_resolution);
+    const bool needs_build_vk = !g.frame_ready || w != g.backbuffer_width || h != g.backbuffer_height ||
+                                work_w != g.width || work_h != g.height || bbf != g.bb_fmt;
     if (ok && needs_build_vk && g.create_grace < g_cfg.create_delay)
     {
         if (++g.create_grace == 1)
@@ -2813,10 +2825,24 @@ static void FeedFrameVk(reshade::api::effect_runtime *rt, reshade::api::command_
     }
     if (ok && needs_build_vk)
     {
-        Log("[feed] building: %ux%u backbuffer %s (Vulkan transport, depth reversed=%d)", w, h,
-            FormatName(bbf), g.depth_reversed ? 1 : 0);
-        ok = BuildResourcesVk(w, h, bbf);
-        if (!ok) FeedFail("resource build");
+        Log("[feed] building: %ux%u work resolution (%d%%) -> %ux%u backbuffer %s (Vulkan transport, depth reversed=%d)",
+            work_w, work_h, g_cfg.work_resolution, w, h, FormatName(bbf), g.depth_reversed ? 1 : 0);
+        ok = BuildResourcesVk(work_w, work_h, w, h, bbf);
+        if (!ok && (work_w != w || work_h != h))
+        {
+            // Reduced-resolution scaling hit something the driver refuses (blit support
+            // for R32_FLOAT / R16G16_FLOAT is optional in Vulkan, and we hold no
+            // VkPhysicalDevice to pre-check it). Fall back to the proven 100% path
+            // rather than failing every frame; persisted so the periodic CfgReload does
+            // not flip the setting straight back to the failing value.
+            Log("[feed] WARNING: reduced-resolution build failed; falling back to work_resolution=100");
+            g_cfg.work_resolution = 100;
+            g_work_resolution_ui  = 100;
+            CfgSave();
+            g.frame_ready = false;
+            ok = false;
+        }
+        else if (!ok) FeedFail("resource build");
         else g.consecutive_fails = 0;
     }
 
