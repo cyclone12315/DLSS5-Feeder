@@ -54,6 +54,7 @@
 #include "feed_vk.h"   // raw-Vulkan interop for the Vulkan transport (see PLAN-VULKAN)
 #include "feed_vk_hook.h"   // in-process vkCreateDevice hook: appends the interop extensions the transport needs
 #include "feed_gl.h"   // raw-OpenGL interop for the OpenGL transport (see PLAN-OPENGL)
+#include "feed_probe.h"   // Eden Vulkan scene-texture discovery probe (diagnostic; gated by the "probe" cfg key)
 
 #define FEED_VERSION "0.7.0"
 
@@ -271,10 +272,13 @@ static void CfgWriteDefault()
             "preset=%d\n"
             "work_resolution=%d\n"
             "mv_scale_x=%.3f\n"
-            "mv_scale_y=%.3f\n",
+            "mv_scale_y=%.3f\n"
+            "probe=%d\n"
+            "probe_candidate=%d\n",
             g_cfg.enabled, g_cfg.mode, g_cfg.hdr, g_cfg.depth_inverted, g_cfg.flags, g_cfg.reset_every,
             g_cfg.warmup_rebuild, g_cfg.rebuild, g_cfg.log_frames, g_cfg.create_delay, g_cfg.preset,
-            g_cfg.work_resolution, g_cfg.mv_scale_x, g_cfg.mv_scale_y);
+            g_cfg.work_resolution, g_cfg.mv_scale_x, g_cfg.mv_scale_y,
+            probe::g_enabled, probe::g_candidate);
     fclose(f);
     Log("[feed] wrote default config to %s", path);
 }
@@ -309,6 +313,8 @@ static bool CfgReload()
         else if (_stricmp(key, "work_resolution")== 0) next.work_resolution = iv;
         else if (_stricmp(key, "mv_scale_x")     == 0) next.mv_scale_x     = val;
         else if (_stricmp(key, "mv_scale_y")     == 0) next.mv_scale_y     = val;
+        else if (_stricmp(key, "probe")          == 0) probe::g_enabled    = iv ? 1 : 0;
+        else if (_stricmp(key, "probe_candidate")== 0) probe::g_candidate  = iv;
     }
     fclose(f);
     if (next.mode < 0 || next.mode > 2) next.mode = g_cfg.mode;
@@ -3745,6 +3751,13 @@ static void OnRenderTechnique(reshade::api::effect_runtime *rt, reshade::api::ef
                               reshade::api::command_list *cl, reshade::api::resource_view rtv,
                               reshade::api::resource_view /*rtv_srgb*/)
 {
+    // The texture probe runs outside the DLSS contract: it must fire even when the
+    // DLSS5_Feed.fx technique is missing, and it owns the frame while enabled.
+    if (probe::g_enabled)
+    {
+        probe::OnRenderTechniqueTick(rt, cl, rtv);
+        return;
+    }
     if (rt != g.runtime || g.technique.handle == 0 || technique.handle != g.technique.handle) return;
     FeedFrame(rt, cl, rtv);
 }
@@ -3937,6 +3950,11 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID)
         CfgReload();
         DetectRenodxAddon();
 
+        probe::ProbeRegisterEvents();   // handlers are no-ops while the "probe" key is 0
+        reshade::register_overlay("Eden Vulkan Texture Probe", probe::DrawProbeOverlay);
+        if (probe::g_enabled)
+            Log("[probe] Vulkan texture discovery enabled (DLSS feed inert; captures go to dlss5-probe\\)");
+
         reshade::register_event<reshade::addon_event::create_device>(OnCreateDevice);
         reshade::register_event<reshade::addon_event::init_effect_runtime>(OnInitEffectRuntime);
         reshade::register_event<reshade::addon_event::destroy_effect_runtime>(OnDestroyEffectRuntime);
@@ -3947,6 +3965,9 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID)
     }
     else if (reason == DLL_PROCESS_DETACH)
     {
+        reshade::unregister_overlay("Eden Vulkan Texture Probe", probe::DrawProbeOverlay);
+        // Probe event handlers die with unregister_addon below; the D3D12/D3D11 ones
+        // are spelled out because they own session state that must be released first.
         reshade::unregister_overlay(nullptr, DrawOverlay);
         reshade::unregister_event<reshade::addon_event::create_device>(OnCreateDevice);
         reshade::unregister_event<reshade::addon_event::init_effect_runtime>(OnInitEffectRuntime);
