@@ -138,6 +138,7 @@ static const char *FmtName(unsigned f)
     case reshade::api::format::b8g8r8a8_typeless:   return "B8G8R8A8_TYPELESS";
     case reshade::api::format::b8g8r8a8_unorm:      return "B8G8R8A8_UNORM";
     case reshade::api::format::b8g8r8a8_unorm_srgb: return "B8G8R8A8_SRGB";
+    case reshade::api::format::r10g10b10a2_typeless:return "R10G10B10A2_TYPELESS";
     case reshade::api::format::r16g16b16a16_float:  return "R16G16B16A16_FLOAT";
     case reshade::api::format::r11g11b10_float:     return "R11G11B10_FLOAT";
     case reshade::api::format::r10g10b10a2_unorm:   return "R10G10B10A2_UNORM";
@@ -576,7 +577,14 @@ static void CaptureAndSave(reshade::api::effect_runtime *rt, reshade::api::comma
             { unsigned(reshade::api::format::b8g8r8a8_unorm),     "B8G8R8A8_UNORM", 32, true },
             { unsigned(reshade::api::format::r8g8b8a8_unorm_srgb),     "R8G8B8A8_SRGB",  32, false },
             { unsigned(reshade::api::format::b8g8r8a8_unorm_srgb),     "B8G8R8A8_SRGB",  32, true },
+            // TYPELESS resources are captured interpreted as the matching UNORM
+            // family; if the real backing store is the opposite channel order the
+            // BMP will show swapped R/B -- still diagnostic gold.
+            { unsigned(reshade::api::format::r8g8b8a8_typeless),  "R8G8B8A8_TYPELESS(as RGBA8)", 32, false },
+            { unsigned(reshade::api::format::b8g8r8a8_typeless),  "B8G8R8A8_TYPELESS(as BGRA8)", 32, true },
+            { unsigned(reshade::api::format::r10g10b10a2_typeless),"R10G10B10A2_TYPELESS", 32, false },
             { unsigned(reshade::api::format::r10g10b10a2_unorm),  "R10G10B10A2_UNORM", 32, false },
+            { unsigned(reshade::api::format::r11g11b10_float),    "R11G11B10_FLOAT", 32, false },
             { unsigned(reshade::api::format::r16g16b16a16_float), "R16G16B16A16_FLOAT", 64, false },
         };
         bool ok = false;
@@ -680,7 +688,30 @@ static void CaptureAndSave(reshade::api::effect_runtime *rt, reshade::api::comma
                 else
                 {
                     const uint32_t px = *reinterpret_cast<const uint32_t *>(s + uint64_t(x) * 4);
-                    if (fmt.name[0] == 'R' && fmt.name[1] == '1' && fmt.name[2] == '0')
+                    if (fmt.name[0] == 'R' && fmt.name[1] == '1' && fmt.name[2] == '1')
+                    {
+                        // R11G11B10_FLOAT decode
+                        auto f11 = [](uint32_t e, uint32_t m) {
+                            float v;
+                            if (e == 0) v = float(m) * ldexpf(1.0f, -14) / 64.0f;
+                            else if (e == 31) v = 1.0f;
+                            else v = (1.0f + float(m) / 64.0f) * ldexpf(1.0f, int(e) - 15);
+                            if (v < 0) v = 0; if (v > 1) v = 1;
+                            return uint8_t(v * 255.0f + 0.5f);
+                        };
+                        auto f10 = [](uint32_t e, uint32_t m) {
+                            float v;
+                            if (e == 0) v = float(m) * ldexpf(1.0f, -14) / 32.0f;
+                            else if (e == 31) v = 1.0f;
+                            else v = (1.0f + float(m) / 32.0f) * ldexpf(1.0f, int(e) - 15);
+                            if (v < 0) v = 0; if (v > 1) v = 1;
+                            return uint8_t(v * 255.0f + 0.5f);
+                        };
+                        r = f11((px >> 6) & 0x1F, (px >> 0) & 0x3F);
+                        g = f11((px >> 17) & 0x1F, (px >> 11) & 0x3F);
+                        b = f10((px >> 27) & 0x1F, (px >> 22) & 0x1F);
+                    }
+                    else if (fmt.name[0] == 'R' && fmt.name[1] == '1' && fmt.name[2] == '0')
                     {
                         r = uint8_t(((px >> 0) & 0x3FF) >> 2);
                         g = uint8_t(((px >> 10) & 0x3FF) >> 2);
