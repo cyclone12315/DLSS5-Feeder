@@ -2760,6 +2760,10 @@ static void FeedFrameVk(reshade::api::effect_runtime *rt, reshade::api::command_
     LARGE_INTEGER t0, t1;
     QueryPerformanceCounter(&t0);
 
+    // The work-resolution slider's debounced apply must tick here too -- upstream only
+    // called it in FeedFrame11 (the slider was D3D11-only there), so on Vulkan the
+    // pending value silently never applied and the scale appeared to do nothing.
+    if (ApplyPendingWorkResolution()) g.frame_ready = false;
     if ((g.frames_done % 60) == 0 && CfgReload()) g.frame_ready = false;
     if (!g_cfg.enabled || g_cfg.mode == 0) return;
 
