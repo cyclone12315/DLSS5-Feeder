@@ -2863,16 +2863,31 @@ static void FeedFrameVk(reshade::api::effect_runtime *rt, reshade::api::command_
             g.vk_layout_init = true;
         }
         // Game images -> copy_source via ReShade (its layout tracking stays correct),
-        // then raw-copy each into our GENERAL image.
+        // then copy or scale each into our GENERAL image. At work_resolution=100 the
+        // path is the untouched upstream equal-size vkCmdCopyImage; below 100% color is
+        // blitted down with LINEAR, while mv/depth/mask use NEAREST -- data-like
+        // resources, matching the D3D11 path's point-sampler resample.
         {
             const resource       res[3]  = { bb_res, mv_res, depth_res };
             const resource_usage from[3] = { resource_usage::render_target, resource_usage::shader_resource, resource_usage::shader_resource };
             const resource_usage to[3]   = { resource_usage::copy_source, resource_usage::copy_source, resource_usage::copy_source };
             cl->barrier(3, res, from, to);
         }
-        FeedVkCopyImage(&g.vk, cb, bb_img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, g.vk_img[SLOT_COLOR], VK_IMAGE_LAYOUT_GENERAL, w, h);
-        FeedVkCopyImage(&g.vk, cb, mv_img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, g.vk_img[SLOT_MV],    VK_IMAGE_LAYOUT_GENERAL, w, h);
-        FeedVkCopyImage(&g.vk, cb, dp_img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, g.vk_img[SLOT_DEPTH], VK_IMAGE_LAYOUT_GENERAL, w, h);
+        if (work_w == w && work_h == h)
+        {
+            FeedVkCopyImage(&g.vk, cb, bb_img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, g.vk_img[SLOT_COLOR], VK_IMAGE_LAYOUT_GENERAL, w, h);
+            FeedVkCopyImage(&g.vk, cb, mv_img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, g.vk_img[SLOT_MV],    VK_IMAGE_LAYOUT_GENERAL, w, h);
+            FeedVkCopyImage(&g.vk, cb, dp_img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, g.vk_img[SLOT_DEPTH], VK_IMAGE_LAYOUT_GENERAL, w, h);
+        }
+        else
+        {
+            FeedVkBlitImage(&g.vk, cb, bb_img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, g.vk_img[SLOT_COLOR], VK_IMAGE_LAYOUT_GENERAL,
+                            w, h, work_w, work_h, VK_FILTER_LINEAR);
+            FeedVkBlitImage(&g.vk, cb, mv_img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, g.vk_img[SLOT_MV],    VK_IMAGE_LAYOUT_GENERAL,
+                            w, h, work_w, work_h, VK_FILTER_NEAREST);
+            FeedVkBlitImage(&g.vk, cb, dp_img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, g.vk_img[SLOT_DEPTH], VK_IMAGE_LAYOUT_GENERAL,
+                            w, h, work_w, work_h, VK_FILTER_NEAREST);
+        }
         if (g.mask_ok)
         {
             // The mask goes the same way, and is handed straight back to shader_resource here.
@@ -2883,7 +2898,11 @@ static void FeedFrameVk(reshade::api::effect_runtime *rt, reshade::api::command_
                 const resource_usage to[1]   = { resource_usage::copy_source };
                 cl->barrier(1, res, from, to);
             }
-            FeedVkCopyImage(&g.vk, cb, mk_img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, g.vk_img[SLOT_MASK], VK_IMAGE_LAYOUT_GENERAL, w, h);
+            if (work_w == w && work_h == h)
+                FeedVkCopyImage(&g.vk, cb, mk_img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, g.vk_img[SLOT_MASK], VK_IMAGE_LAYOUT_GENERAL, w, h);
+            else
+                FeedVkBlitImage(&g.vk, cb, mk_img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, g.vk_img[SLOT_MASK], VK_IMAGE_LAYOUT_GENERAL,
+                                w, h, work_w, work_h, VK_FILTER_NEAREST);
             {
                 const resource       res[1]  = { mask_res };
                 const resource_usage from[1] = { resource_usage::copy_source };
@@ -2954,8 +2973,14 @@ static void FeedFrameVk(reshade::api::effect_runtime *rt, reshade::api::command_
                 ep.InRenderSubrectDimensions.Width  = g.width;
                 ep.InRenderSubrectDimensions.Height = g.height;
                 ep.InReset           = reset;
-                ep.InMVScaleX        = g_cfg.mv_scale_x;
-                ep.InMVScaleY        = g_cfg.mv_scale_y;
+                // The FX outputs pixel-space motion vectors at the NATIVE resolution; at a
+                // reduced work size their magnitudes must be converted into work pixel
+                // space (0.75 at 75%) before the user multiplier. Exactly ONE conversion,
+                // here through NGX's MV scale parameters -- vkCmdBlitImage cannot rescale
+                // values in flight, and the D3D11 path does the same conversion inside its
+                // resample shader. MVLowRes already covers the resolution difference.
+                ep.InMVScaleX        = g_cfg.mv_scale_x * static_cast<float>(g.width)  / static_cast<float>(g.backbuffer_width);
+                ep.InMVScaleY        = g_cfg.mv_scale_y * static_cast<float>(g.height) / static_cast<float>(g.backbuffer_height);
                 ep.InPreExposure     = 1.0f;
                 ep.InExposureScale   = 1.0f;
 
@@ -2999,18 +3024,35 @@ static void FeedFrameVk(reshade::api::effect_runtime *rt, reshade::api::command_
             cb = reinterpret_cast<VkCommandBuffer>(cl->get_native());  // fresh buffer after the flush
             if (done)
             {
-                // Prefer the raw copy. vkCmdBlitImage converts, and that conversion is
-                // sRGB-aware: blitting our linear-typed output into a VK_FORMAT_*_SRGB
-                // swapchain applies a linear->sRGB encode and the frame comes back much
-                // brighter with lifted blacks (issue #11). The frame we were handed is
-                // already encoded, so the bytes must go home untouched. The blit stays
-                // only for the layouts a raw copy genuinely cannot express.
-                if (SameTexelLayout(g.output_fmt, g.bb_fmt))
-                    FeedVkCopyImage(&g.vk, cb, g.vk_img[SLOT_OUTPUT], VK_IMAGE_LAYOUT_GENERAL,
-                                    bb_img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, w, h);
+                if (work_w == w && work_h == h)
+                {
+                    // Prefer the raw copy. vkCmdBlitImage converts, and that conversion is
+                    // sRGB-aware: blitting our linear-typed output into a VK_FORMAT_*_SRGB
+                    // swapchain applies a linear->sRGB encode and the frame comes back much
+                    // brighter with lifted blacks (issue #11). The frame we were handed is
+                    // already encoded, so the bytes must go home untouched. The blit stays
+                    // only for the layouts a raw copy genuinely cannot express.
+                    if (SameTexelLayout(g.output_fmt, g.bb_fmt))
+                        FeedVkCopyImage(&g.vk, cb, g.vk_img[SLOT_OUTPUT], VK_IMAGE_LAYOUT_GENERAL,
+                                        bb_img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, w, h);
+                    else
+                        FeedVkBlitImage(&g.vk, cb, g.vk_img[SLOT_OUTPUT], VK_IMAGE_LAYOUT_GENERAL,
+                                        bb_img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, w, h, w, h, VK_FILTER_NEAREST);
+                }
                 else
+                {
+                    // Reduced work resolution: the DLSS output lives at the work size and is
+                    // scaled up to the native backbuffer with a LINEAR blit. POC color-space
+                    // caveat: an SRGB-family backbuffer makes this blit apply a linear->sRGB
+                    // encode over already-encoded bytes (the same mechanism as issue #11),
+                    // while the input blit above decoded sRGB->linear -- whether the two
+                    // conversions cancel depends on the exact format pair. Logged at build
+                    // time; any residual brightness shift is a known POC limitation, not
+                    // something this path tries to correct.
                     FeedVkBlitImage(&g.vk, cb, g.vk_img[SLOT_OUTPUT], VK_IMAGE_LAYOUT_GENERAL,
-                                    bb_img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, w, h, w, h, VK_FILTER_NEAREST);
+                                    bb_img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                                    work_w, work_h, w, h, VK_FILTER_LINEAR);
+                }
             }
             {
                 const resource       res[1]  = { bb_res };
@@ -3024,7 +3066,8 @@ static void FeedFrameVk(reshade::api::effect_runtime *rt, reshade::api::command_
                 const UINT64 fn = ++g.frames_done;
                 g.consecutive_fails = 0;
                 if (fn <= static_cast<UINT64>(g_cfg.log_frames) || (fn % 1800) == 0)
-                    Log("[feed] frame %llu delivered (%ux%u, reset=%d, Vulkan transport)", fn, g.width, g.height, reset);
+                    Log("[feed] frame %llu delivered (%ux%u at %d%% -> %ux%u backbuffer, reset=%d, Vulkan transport)",
+                        fn, g.width, g.height, g_cfg.work_resolution, g.backbuffer_width, g.backbuffer_height, reset);
 
                 if (g_cfg.warmup_rebuild > 0 && !g.warmup_done && !g_renodx_lazy && fn >= static_cast<UINT64>(g_cfg.warmup_rebuild))
                 {
