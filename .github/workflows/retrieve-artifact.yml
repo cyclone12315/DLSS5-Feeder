@@ -32,13 +32,13 @@ jobs:
           github-token: ${{ secrets.GITHUB_TOKEN }}
           path: artifact
 
-      - name: Commit the addon binaries into the branch
+      - name: Commit the artifact contents into the branch
         shell: bash
         run: |
           set -euo pipefail
           mkdir -p dist
-          find artifact -name 'dlss5-feed.addon64' -exec cp {} dist/ \;
-          find artifact -name 'dlss5-feed.addon32' -exec cp {} dist/ \; || true
+          find artifact -type f -print
+          find artifact -type f -exec cp {} dist/ \;
           ls -la dist
           git config user.name "artifact-retriever"
           git config user.email "noreply@github.com"
