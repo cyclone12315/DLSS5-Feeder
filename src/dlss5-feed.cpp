@@ -2921,7 +2921,10 @@ static void FeedFrameVk(reshade::api::effect_runtime *rt, reshade::api::command_
                 const resource_usage to[3]   = { resource_usage::copy_dest, resource_usage::shader_resource, resource_usage::shader_resource };
                 cl->barrier(3, res, from, to);
             }
-            FeedVkCopyImage(&g.vk, cb, g.vk_img[SLOT_COLOR], VK_IMAGE_LAYOUT_GENERAL, bb_img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, w / 2, h);
+            // Diagnostic split-screen. Clamped to the smaller (work) image so the copy
+            // stays in-bounds at reduced work resolutions; identical extents at 100%.
+            FeedVkCopyImage(&g.vk, cb, g.vk_img[SLOT_COLOR], VK_IMAGE_LAYOUT_GENERAL, bb_img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                            (work_w < w ? work_w : w) / 2, (work_h < h ? work_h : h));
             {
                 const resource       res[1]  = { bb_res };
                 const resource_usage from[1] = { resource_usage::copy_dest };
