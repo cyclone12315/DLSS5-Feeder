@@ -6,7 +6,7 @@ name: build-and-commit
 # avoid a trigger loop.
 on:
   push:
-    branches: [vulkan-work-res-poc]
+    branches: [vulkan-work-res-poc, eden-texture-probe]
     paths-ignore:
       - 'dist/**'
   workflow_dispatch:
