@@ -14,9 +14,9 @@
 //
 // Capture model (staged, per spec section 7):
 //  Frame N:   user selects a candidate from last frame's Top-10 snapshot.
-//  Frame N+1: when the selected RT-exit occurrence is observed through the
-//             after-barrier event, the snapshot and texture-to-buffer copy are
-//             recorded in that same application command list. Submission is
+//  Frame N+1: when the selected safe capture-point occurrence is observed
+//             through the after-barrier event, the snapshot and texture-to-
+//             buffer copy are recorded in that same application command list. Submission is
 //             tracked explicitly; a queue fence is waited before the buffer is
 //             mapped and the BMP + metadata are written. There is no guessed
 //             late-state fallback.
@@ -49,7 +49,8 @@ namespace probe {
 
 static std::atomic<int> g_enabled { 0 }; // "probe" key: 1 = discovery active, DLSS feed inert
 static std::atomic<int> g_candidate { 1 }; // "probe_candidate" key: selected rank, 1-based
-static std::atomic<int> g_capture_occurrence { 1 }; // selected RT-exit occurrence, 1-based
+static std::atomic<int> g_capture_point { 1 }; // 0 = explicit RT exit, 1 = pre-RT reuse
+static std::atomic<int> g_capture_occurrence { 1 }; // selected safe point occurrence, 1-based
 static int  g_log_summary_every = 300;
 
 // Set by the host (dlss5-feed.cpp) so the overlay toggle can persist itself
@@ -130,6 +131,7 @@ struct ResourceDelta
 struct CommandRecord
 {
     ActiveRt active;
+    bool in_render_pass = false;
     std::unordered_map<uint64_t, ResourceDelta> deltas;
     std::unordered_map<uint64_t, reshade::api::resource_usage> final_states;
     std::vector<std::pair<uint64_t, uint64_t>> edges;
@@ -175,7 +177,15 @@ struct PendingCapture
     Snapshot snap;           // full selected snapshot (previous-frame stats, kept separate)
     uint64_t armed_frame = 0;
     uint32_t candidate_rank = 0;
-    uint32_t desired_exit = 1, observed_exits = 0;
+    uint32_t capture_point = 1, desired_occurrence = 1, observed_points = 0;
+    uint32_t all_barriers = 0, observed_exits = 0, observed_reuses = 0;
+    uint32_t render_pass_begins = 0, render_pass_ends = 0;
+    uint32_t skipped_inside_render_pass = 0, skipped_without_submitted_draw = 0;
+    reshade::api::resource_usage last_old_state = reshade::api::resource_usage::undefined;
+    reshade::api::resource_usage last_new_state = reshade::api::resource_usage::undefined;
+    reshade::api::resource_usage trigger_old_state = reshade::api::resource_usage::undefined;
+    reshade::api::resource_usage trigger_new_state = reshade::api::resource_usage::undefined;
+    uint64_t trigger_frame = 0;
     uint64_t source_cmd = 0;      // command list that owns the recorded capture commands
     uint64_t submission_cmd = 0;  // primary command list whose submission executes them
     reshade::api::command_queue *source_queue = nullptr;
@@ -183,6 +193,16 @@ struct PendingCapture
                              // 3 = recorded, 4 = submitted, 5 = completing
 };
 static PendingCapture g_pending;
+
+enum class CaptureResultStatus : uint32_t { none, success, timeout, failed, cancelled };
+struct LastCaptureResult
+{
+    CaptureResultStatus status = CaptureResultStatus::none;
+    PendingCapture capture;
+    uint64_t result_frame = 0;
+    char reason[96] = {};
+};
+static LastCaptureResult g_last_capture;
 static reshade::api::resource   g_snap_res = { 0 };          // probe-owned snapshot texture
 static bool                     g_snap_valid = false;
 
@@ -202,6 +222,39 @@ static void Log(const char *fmt, ...)
     vsnprintf(buf, sizeof(buf), fmt, args);
     va_end(args);
     reshade::log::message(reshade::log::level::info, buf);
+}
+
+static const char *CapturePointName(uint32_t point)
+{
+    return point == 0 ? "explicit_rt_exit" : "pre_rt_reuse";
+}
+
+static const char *CaptureResultName(CaptureResultStatus status)
+{
+    switch (status)
+    {
+    case CaptureResultStatus::success: return "SUCCESS";
+    case CaptureResultStatus::timeout: return "TIMEOUT";
+    case CaptureResultStatus::failed: return "FAILED";
+    case CaptureResultStatus::cancelled: return "CANCELLED";
+    default: return "NONE";
+    }
+}
+
+// Caller holds g_lock exclusively. Keep the terminal diagnostics after the
+// active request is cleared so the overlay can explain what happened.
+static void StoreLastCaptureResultLocked(CaptureResultStatus status, const char *reason)
+{
+    g_last_capture.status = status;
+    g_last_capture.capture = g_pending;
+    g_last_capture.result_frame = g_frame.load(std::memory_order_relaxed);
+    strncpy_s(g_last_capture.reason, reason != nullptr ? reason : "", _TRUNCATE);
+}
+
+static void ClearPendingWithResultLocked(CaptureResultStatus status, const char *reason)
+{
+    StoreLastCaptureResultLocked(status, reason);
+    g_pending = {};
 }
 
 static TexInfo *FindTex(uint64_t h)
@@ -337,7 +390,7 @@ static void OnDestroyDevice(reshade::api::device *device)
         AcquireSRWLockExclusive(&g_lock);
         g_tex.clear(); g_private_resources.clear(); g_commands.clear(); g_retired_resources.clear();
         g_edges.clear(); g_swapchain_res.clear(); g_top.clear();
-        g_pending = {};
+        g_pending = {}; g_last_capture = {};
         g_frame.store(0, std::memory_order_relaxed);
         g_record_event_seq.store(0, std::memory_order_relaxed);
         ReleaseSRWLockExclusive(&g_lock);
@@ -435,7 +488,7 @@ static void OnResourceDestroy(reshade::api::device *, reshade::api::resource res
     }
     if (g_pending.stage == 1 && g_pending.snap.handle == h)
     {
-        g_pending = {};
+        ClearPendingWithResultLocked(CaptureResultStatus::cancelled, "selected resource was destroyed");
         cancelled_pending = true;
     }
     ReleaseSRWLockExclusive(&g_lock);
@@ -532,12 +585,23 @@ static void ClearActiveAttachments(reshade::api::command_list *cmd_list)
     if (it != g_commands.end())
     {
         CommandRecord &record = it->second;
+        if (g_pending.stage == 1)
+            for (uint32_t i = 0; i < record.active.rt_count; ++i)
+                if (record.active.rt_res[i] == g_pending.snap.handle)
+                {
+                    ++g_pending.render_pass_ends;
+                    break;
+                }
         // The add-on render-pass descriptor does not expose Vulkan finalLayout.
         // Mark attachment state unknown until a later explicit barrier observes it.
         for (uint32_t i = 0; i < record.active.rt_count; ++i)
             record.final_states[record.active.rt_res[i]] = reshade::api::resource_usage::undefined;
         if (record.active.dsv_res != 0)
             record.final_states[record.active.dsv_res] = reshade::api::resource_usage::undefined;
+        // end_render_pass is a before-event. No command callback can interleave
+        // before the native end returns, so clearing this flag here accurately
+        // describes every later barrier callback on this command list.
+        record.in_render_pass = false;
         // Render-pass end unbinds attachments, but Vulkan dynamic viewport state
         // remains command-list state until changed or the list is reset.
         record.active.rt_count = 0;
@@ -589,6 +653,17 @@ static bool OnBeginRenderPass(reshade::api::command_list *cmd_list, uint32_t cou
         if (res.handle != 0) dsv_res = res.handle;
     }
     SetActiveAttachments(cmd_list, rt_res, n, dsv_res); // a render pass establishes a NEW attachment set
+    AcquireSRWLockExclusive(&g_lock);
+    CommandRecord &record = g_commands[cmd_list->get_native()];
+    record.in_render_pass = true;
+    if (g_pending.stage == 1)
+        for (uint32_t i = 0; i < n; ++i)
+            if (rt_res[i] == g_pending.snap.handle)
+            {
+                ++g_pending.render_pass_begins;
+                break;
+            }
+    ReleaseSRWLockExclusive(&g_lock);
     return false;
 }
 
@@ -766,6 +841,7 @@ static void OnBarrier(reshade::api::command_list *cmd_list, uint32_t count,
 
     bool trigger = false;
     uint64_t trigger_res = 0;
+    uint32_t trigger_point = 0, trigger_occurrence = 0;
     reshade::api::resource_usage trigger_state = reshade::api::resource_usage::undefined;
 
     AcquireSRWLockExclusive(&g_lock);
@@ -776,23 +852,56 @@ static void OnBarrier(reshade::api::command_list *cmd_list, uint32_t count,
         if (h == 0 || g_private_resources.count(h) != 0) continue;
         record.final_states[h] = new_states[i];
 
-        const bool rt_exit =
-            (old_states[i] & reshade::api::resource_usage::render_target) != reshade::api::resource_usage::undefined &&
-            (new_states[i] & reshade::api::resource_usage::render_target) == reshade::api::resource_usage::undefined;
-        if (!trigger && rt_exit && g_pending.stage == 1 && h == g_pending.snap.handle && FindTex(h) != nullptr)
+        if (g_pending.stage != 1 || h != g_pending.snap.handle)
+            continue;
+
+        ++g_pending.all_barriers;
+        g_pending.last_old_state = old_states[i];
+        g_pending.last_new_state = new_states[i];
+
+        const bool old_rt =
+            (old_states[i] & reshade::api::resource_usage::render_target) != reshade::api::resource_usage::undefined;
+        const bool new_rt =
+            (new_states[i] & reshade::api::resource_usage::render_target) != reshade::api::resource_usage::undefined;
+        const bool rt_exit = old_rt && !new_rt;
+        // An undefined old state may legally discard prior contents, so it is
+        // diagnostic-only and never a pre-reuse capture point.
+        const bool pre_rt_reuse = !old_rt && new_rt && old_states[i] != reshade::api::resource_usage::undefined;
+        if (rt_exit) ++g_pending.observed_exits;
+        if (pre_rt_reuse) ++g_pending.observed_reuses;
+
+        const bool selected_point = g_pending.capture_point == 0 ? rt_exit : pre_rt_reuse;
+        if (trigger || !selected_point)
+            continue;
+
+        const TexInfo *tracked = FindTex(h);
+        if (record.in_render_pass)
         {
-            ++g_pending.observed_exits;
-            if (g_pending.observed_exits == g_pending.desired_exit)
-            {
-                // Claim under the lock so concurrent command-buffer recording
-                // cannot create two snapshots for one request.
-                g_pending.stage = 2;
-                g_pending.source_cmd = cmd_list->get_native();
-                g_pending.submission_cmd = cmd_list->get_native();
-                trigger = true;
-                trigger_res = h;
-                trigger_state = new_states[i]; // barrier callback is AFTER the application barrier
-            }
+            ++g_pending.skipped_inside_render_pass;
+            continue;
+        }
+        if (tracked == nullptr || tracked->total_draw_calls == 0)
+        {
+            ++g_pending.skipped_without_submitted_draw;
+            continue;
+        }
+
+        ++g_pending.observed_points;
+        if (g_pending.observed_points == g_pending.desired_occurrence)
+        {
+            // Claim under the lock so concurrent command-buffer recording
+            // cannot create two snapshots for one request.
+            g_pending.stage = 2;
+            g_pending.source_cmd = cmd_list->get_native();
+            g_pending.submission_cmd = cmd_list->get_native();
+            g_pending.trigger_old_state = old_states[i];
+            g_pending.trigger_new_state = new_states[i];
+            g_pending.trigger_frame = g_frame.load(std::memory_order_relaxed);
+            trigger = true;
+            trigger_res = h;
+            trigger_state = new_states[i]; // barrier callback is AFTER the application barrier
+            trigger_point = g_pending.capture_point;
+            trigger_occurrence = g_pending.desired_occurrence;
         }
     }
     ReleaseSRWLockExclusive(&g_lock);
@@ -810,7 +919,7 @@ static void OnBarrier(reshade::api::command_list *cmd_list, uint32_t count,
         Log("[probe] staged capture aborted: texture %s is unsupported or lacks copy_source usage",
             FmtName(unsigned(desc.texture.format)));
         AcquireSRWLockExclusive(&g_lock);
-        g_pending = {};
+        ClearPendingWithResultLocked(CaptureResultStatus::failed, "unsupported format or missing copy_source usage");
         ReleaseSRWLockExclusive(&g_lock);
         return;
     }
@@ -825,7 +934,7 @@ static void OnBarrier(reshade::api::command_list *cmd_list, uint32_t count,
     {
         Log("[probe] staged capture aborted: snapshot texture creation failed");
         AcquireSRWLockExclusive(&g_lock);
-        g_pending = {};
+        ClearPendingWithResultLocked(CaptureResultStatus::failed, "snapshot texture creation failed");
         ReleaseSRWLockExclusive(&g_lock);
         return;
     }
@@ -840,7 +949,7 @@ static void OnBarrier(reshade::api::command_list *cmd_list, uint32_t count,
         g_device->destroy_resource(snap);
         Log("[probe] staged capture aborted: readback buffer creation failed");
         AcquireSRWLockExclusive(&g_lock);
-        g_pending = {};
+        ClearPendingWithResultLocked(CaptureResultStatus::failed, "readback buffer creation failed");
         ReleaseSRWLockExclusive(&g_lock);
         return;
     }
@@ -864,17 +973,16 @@ static void OnBarrier(reshade::api::command_list *cmd_list, uint32_t count,
     cmd_list->barrier(1, &snap, &copy_dest, &copy_source);
     cmd_list->copy_texture_to_buffer(snap, 0, nullptr, buffer, 0, 0, 0);
 
-    uint32_t recorded_exit = 0;
     AcquireSRWLockExclusive(&g_lock);
     g_snap_res = snap;
     g_snap_valid = true;
     g_capture_buffer = buffer;
     g_capture_buffer_size = buffer_size;
-    recorded_exit = g_pending.desired_exit;
     g_pending.stage = 3;
     ReleaseSRWLockExclusive(&g_lock);
-    Log("[probe] staged capture recorded at RT exit %u (frame %llu)",
-        recorded_exit, (unsigned long long)g_frame.load(std::memory_order_relaxed));
+    Log("[probe] staged capture recorded at %s occurrence %u (frame %llu)",
+        CapturePointName(trigger_point), trigger_occurrence,
+        (unsigned long long)g_frame.load(std::memory_order_relaxed));
 }
 
 // ---------------------------------------------------------------------------
@@ -1061,7 +1169,8 @@ static void OnResetCommandList(reshade::api::command_list *cmd_list)
         if (g_snap_res.handle != 0) release.push_back(g_snap_res);
         if (g_capture_buffer.handle != 0) release.push_back(g_capture_buffer);
         g_snap_res = { 0 }; g_capture_buffer = { 0 }; g_capture_buffer_size = 0;
-        g_snap_valid = false; g_pending = {};
+        g_snap_valid = false;
+        ClearPendingWithResultLocked(CaptureResultStatus::failed, "source command list reset before submission");
     }
     else if (g_pending.stage == 3 && g_pending.submission_cmd == command)
     {
@@ -1180,15 +1289,24 @@ static void OnPresent(reshade::api::command_queue *queue, reshade::api::swapchai
     SyncSwapchainBackbuffers(swapchain);
 
     bool capture_timed_out = false;
+    PendingCapture timeout_capture;
     AcquireSRWLockExclusive(&g_lock);
     if (g_pending.stage == 1 &&
-        g_frame.load(std::memory_order_relaxed) - g_pending.armed_frame > 600)
+        g_frame.load(std::memory_order_relaxed) - g_pending.armed_frame > 180)
     {
-        g_pending = {};
+        timeout_capture = g_pending;
+        ClearPendingWithResultLocked(CaptureResultStatus::timeout, "requested safe capture point did not occur");
         capture_timed_out = true;
     }
     ReleaseSRWLockExclusive(&g_lock);
-    if (capture_timed_out) Log("[probe] capture abandoned: requested RT exit did not occur");
+    if (capture_timed_out)
+        Log("[probe] capture timeout: resource=0x%016llX mode=%s occurrence=%u barriers=%u explicit_rt_exits=%u pre_rt_reuses=%u safe_points=%u render_pass_begin/end=%u/%u skipped_inside=%u skipped_no_draw=%u last_transition=0x%X->0x%X",
+            (unsigned long long)timeout_capture.snap.handle, CapturePointName(timeout_capture.capture_point),
+            timeout_capture.desired_occurrence, timeout_capture.all_barriers, timeout_capture.observed_exits,
+            timeout_capture.observed_reuses, timeout_capture.observed_points, timeout_capture.render_pass_begins,
+            timeout_capture.render_pass_ends, timeout_capture.skipped_inside_render_pass,
+            timeout_capture.skipped_without_submitted_draw, unsigned(timeout_capture.last_old_state),
+            unsigned(timeout_capture.last_new_state));
     FinalizeFrame();
 }
 
@@ -1198,12 +1316,12 @@ static void OnPresent(reshade::api::command_queue *queue, reshade::api::swapchai
 
 // Write the BMP + metadata from a mapped readback buffer (tightly packed rows:
 // the copy used row_length = 0 / slice_height = 0, so pitch is w * bytes/px).
-static void WriteCaptureOutput(const char *pathbmp, const char *pathtxt, const FmtInfo &fi,
+static bool WriteCaptureOutput(const char *pathbmp, const char *pathtxt, const FmtInfo &fi,
                                uint32_t w, uint32_t h, uint64_t pitch, const void *mapped,
-                               uint64_t target_handle, uint32_t candidate_rank, uint32_t exit_ordinal,
-                               uint64_t source_cmd, const Snapshot &sel, const TexInfo *live,
+                               const PendingCapture &capture, const TexInfo *live,
                                const std::vector<std::pair<uint64_t, uint64_t>> &edges)
 {
+    const Snapshot &sel = capture.snap;
     const bool f16 = fi.bpp == 64;
     FILE *fp = nullptr;
     if (fopen_s(&fp, pathbmp, "wb") == 0 && fp != nullptr)
@@ -1284,12 +1402,13 @@ static void WriteCaptureOutput(const char *pathbmp, const char *pathtxt, const F
             fwrite(rowbuf.data(), 1, row, fp);
         }
         fclose(fp);
-        Log("[probe] captured %s (%ux%u %s, RT exit %u)", pathbmp, w, h, fi.name, exit_ordinal);
+        Log("[probe] captured %s (%ux%u %s, %s occurrence %u)", pathbmp, w, h, fi.name,
+            CapturePointName(capture.capture_point), capture.desired_occurrence);
     }
     else
     {
         Log("[probe] capture failed: cannot open %s", pathbmp);
-        return;
+        return false;
     }
 
     // Metadata: previous-frame ranking stats ("selected_snapshot") are kept
@@ -1297,11 +1416,22 @@ static void WriteCaptureOutput(const char *pathbmp, const char *pathtxt, const F
     if (fopen_s(&fp, pathtxt, "w") == 0 && fp != nullptr)
     {
         fprintf(fp, "[resource]\nhandle=0x%016llX\nformat=%s (%u)\nsize=%ux%u\nlayers=%u samples=%u\n"
-                    "capture_stage=barrier_after\ncaptured_subresource=0\ncopy_source_capable=%d\n"
-                    "candidate_rank=%u\nrt_exit_ordinal=%u\n"
-                    "source_command_list=0x%016llX\n",
-                (unsigned long long)target_handle, fi.name, fi.f, w, h, sel.layers, sel.samples,
-                int(sel.copy_source_capable), candidate_rank, exit_ordinal, (unsigned long long)source_cmd);
+                    "capture_stage=barrier_after\ncapture_point=%s\ncapture_point_occurrence=%u\n"
+                    "captured_subresource=0\ncopy_source_capable=%d\ncandidate_rank=%u\n"
+                    "source_command_list=0x%016llX\nsubmission_command_list=0x%016llX\n"
+                    "trigger_frame=%llu\ntrigger_old_usage=0x%X\ntrigger_new_usage=0x%X\n"
+                    "barriers_seen_before_trigger=%u\nexplicit_rt_exits_seen=%u\npre_rt_reuses_seen=%u\n"
+                    "safe_points_seen=%u\nrender_pass_begins_seen=%u\nrender_pass_ends_seen=%u\n"
+                    "skipped_inside_render_pass=%u\nskipped_without_submitted_draw=%u\n",
+                (unsigned long long)sel.handle, fi.name, fi.f, w, h, sel.layers, sel.samples,
+                CapturePointName(capture.capture_point), capture.desired_occurrence,
+                int(sel.copy_source_capable), capture.candidate_rank,
+                (unsigned long long)capture.source_cmd, (unsigned long long)capture.submission_cmd,
+                (unsigned long long)capture.trigger_frame, unsigned(capture.trigger_old_state),
+                unsigned(capture.trigger_new_state), capture.all_barriers, capture.observed_exits,
+                capture.observed_reuses, capture.observed_points, capture.render_pass_begins,
+                capture.render_pass_ends, capture.skipped_inside_render_pass,
+                capture.skipped_without_submitted_draw);
         fprintf(fp, "\n[selected_snapshot]\nframe=%llu\nscore=%u\ndraw_calls=%u\ndraw_weight=%u\nrt_binds=%u\n"
                     "had_depth=%d\ndepth_resource=0x%016llX\ndepth_size=%ux%u\ndepth_format=%s\n"
                     "viewport=%ux%u\nviewport_count=%u\nviewport_max=%ux%u\n"
@@ -1328,7 +1458,10 @@ static void WriteCaptureOutput(const char *pathbmp, const char *pathtxt, const F
         if (fi.bpp == 64)
             fprintf(fp, "preview_note=half-float RGB is clamped to [0,1] for the 24-bit BMP; alpha is omitted\n");
         fclose(fp);
+        return true;
     }
+    Log("[probe] capture failed: cannot open %s", pathtxt);
+    return false;
 }
 
 static void CompleteCaptureAtPresent(reshade::api::command_queue *completion_queue)
@@ -1337,9 +1470,8 @@ static void CompleteCaptureAtPresent(reshade::api::command_queue *completion_que
 
     reshade::api::command_queue *source_queue = nullptr;
     reshade::api::resource snap = { 0 }, buffer = { 0 };
-    uint64_t buffer_size = 0, meta_handle = 0, source_cmd = 0;
-    uint32_t candidate_rank = 0, exit_ordinal = 0;
-    Snapshot selected;
+    uint64_t buffer_size = 0;
+    PendingCapture capture;
     {
         AcquireSRWLockExclusive(&g_lock);
         if (g_pending.stage != 4 || g_pending.source_queue == nullptr ||
@@ -1349,15 +1481,11 @@ static void CompleteCaptureAtPresent(reshade::api::command_queue *completion_que
             return;
         }
         source_queue = g_pending.source_queue;
-        source_cmd = g_pending.source_cmd;
         snap = g_snap_res;
         buffer = g_capture_buffer;
         buffer_size = g_capture_buffer_size;
-        meta_handle = g_pending.snap.handle;
-        candidate_rank = g_pending.candidate_rank;
-        exit_ordinal = g_pending.desired_exit;
-        selected = g_pending.snap;
         g_pending.stage = 5; // completion is owned by this present callback
+        capture = g_pending;
         ReleaseSRWLockExclusive(&g_lock);
     }
 
@@ -1382,6 +1510,7 @@ static void CompleteCaptureAtPresent(reshade::api::command_queue *completion_que
         }
     }
 
+    bool output_written = false;
     if (completed && snap.handle != 0 && buffer.handle != 0)
     {
         const reshade::api::resource_desc desc = g_device->get_resource_desc(snap);
@@ -1397,7 +1526,7 @@ static void CompleteCaptureAtPresent(reshade::api::command_queue *completion_que
             std::vector<std::pair<uint64_t, uint64_t>> edges;
             {
                 AcquireSRWLockShared(&g_lock);
-                if (const TexInfo *t = FindTex(meta_handle)) { live_copy = *t; have_live = true; }
+                if (const TexInfo *t = FindTex(capture.snap.handle)) { live_copy = *t; have_live = true; }
                 edges = g_edges;
                 ReleaseSRWLockShared(&g_lock);
             }
@@ -1405,14 +1534,15 @@ static void CompleteCaptureAtPresent(reshade::api::command_queue *completion_que
             char dir[] = "dlss5-probe";
             CreateDirectoryA(dir, nullptr);
             char pathbmp[MAX_PATH], pathtxt[MAX_PATH];
-            snprintf(pathbmp, sizeof(pathbmp), "%s/frame_%06llu_candidate_%02u_exit_%02u_%ux%u.bmp", dir,
-                     (unsigned long long)g_frame.load(std::memory_order_relaxed), candidate_rank, exit_ordinal,
+            snprintf(pathbmp, sizeof(pathbmp), "%s/frame_%06llu_candidate_%02u_%s_%02u_%ux%u.bmp", dir,
+                     (unsigned long long)g_frame.load(std::memory_order_relaxed), capture.candidate_rank,
+                     CapturePointName(capture.capture_point), capture.desired_occurrence,
                      desc.texture.width, desc.texture.height);
-            snprintf(pathtxt, sizeof(pathtxt), "%s/frame_%06llu_candidate_%02u_exit_%02u.txt", dir,
-                     (unsigned long long)g_frame.load(std::memory_order_relaxed), candidate_rank, exit_ordinal);
-            WriteCaptureOutput(pathbmp, pathtxt, fi, desc.texture.width, desc.texture.height, pitch, mapped,
-                               meta_handle, candidate_rank, exit_ordinal, source_cmd, selected,
-                               have_live ? &live_copy : nullptr, edges);
+            snprintf(pathtxt, sizeof(pathtxt), "%s/frame_%06llu_candidate_%02u_%s_%02u.txt", dir,
+                     (unsigned long long)g_frame.load(std::memory_order_relaxed), capture.candidate_rank,
+                     CapturePointName(capture.capture_point), capture.desired_occurrence);
+            output_written = WriteCaptureOutput(pathbmp, pathtxt, fi, desc.texture.width, desc.texture.height,
+                               pitch, mapped, capture, have_live ? &live_copy : nullptr, edges);
             g_device->unmap_buffer_region(buffer);
         }
         else
@@ -1423,10 +1553,13 @@ static void CompleteCaptureAtPresent(reshade::api::command_queue *completion_que
     // A Vulkan command buffer remains executable and may be submitted again.
     // Keep its private resources alive until reset/destroy invalidates the old
     // recording, even though the first execution has completed.
-    if (snap.handle != 0) g_retired_resources[source_cmd].push_back(snap);
-    if (buffer.handle != 0) g_retired_resources[source_cmd].push_back(buffer);
+    if (snap.handle != 0) g_retired_resources[capture.source_cmd].push_back(snap);
+    if (buffer.handle != 0) g_retired_resources[capture.source_cmd].push_back(buffer);
     g_snap_res = { 0 }; g_capture_buffer = { 0 }; g_capture_buffer_size = 0;
-    g_snap_valid = false; g_pending = {};
+    g_snap_valid = false;
+    StoreLastCaptureResultLocked(output_written ? CaptureResultStatus::success : CaptureResultStatus::failed,
+                                 output_written ? "BMP and metadata written" : "readback or output failed");
+    g_pending = {};
     ReleaseSRWLockExclusive(&g_lock);
 }
 
@@ -1440,7 +1573,8 @@ static void DrawProbeOverlay(reshade::api::effect_runtime * /*runtime*/)
     if (ImGui::Checkbox("Probe enabled (DLSS feed is inert while on)", &en))
     {
         AcquireSRWLockExclusive(&g_lock);
-        if (!en && g_pending.stage == 1) g_pending = {};
+        if (!en && g_pending.stage == 1)
+            ClearPendingWithResultLocked(CaptureResultStatus::cancelled, "probe disabled while capture was armed");
         for (auto &entry : g_tex)
         {
             TexInfo &t = entry.second;
@@ -1471,9 +1605,18 @@ static void DrawProbeOverlay(reshade::api::effect_runtime * /*runtime*/)
     const int old_candidate = g_candidate.exchange(candidate, std::memory_order_relaxed);
     if (candidate != old_candidate && g_save_cfg != nullptr) g_save_cfg();
 
+    int capture_point = g_capture_point.load(std::memory_order_relaxed) == 0 ? 0 : 1;
+    const char *capture_points[] = { "Explicit RT exit", "Pre-RT reuse" };
+    ImGui::SetNextItemWidth(180.0f);
+    if (ImGui::Combo("Capture point", &capture_point, capture_points, 2))
+    {
+        g_capture_point.store(capture_point, std::memory_order_relaxed);
+        if (g_save_cfg != nullptr) g_save_cfg();
+    }
+
     int occurrence = std::max(1, g_capture_occurrence.load(std::memory_order_relaxed));
     ImGui::SetNextItemWidth(120.0f);
-    if (ImGui::InputInt("RT exit occurrence", &occurrence))
+    if (ImGui::InputInt("Capture point occurrence", &occurrence))
     {
         g_capture_occurrence.store(std::max(1, occurrence), std::memory_order_relaxed);
         if (g_save_cfg != nullptr) g_save_cfg();
@@ -1482,6 +1625,7 @@ static void DrawProbeOverlay(reshade::api::effect_runtime * /*runtime*/)
     if (ImGui::Button("Capture selected candidate"))
     {
         int status = 0;
+        uint64_t armed_handle = 0;
         AcquireSRWLockExclusive(&g_lock);
         if (g_pending.stage != 0)
             status = 2;
@@ -1494,30 +1638,51 @@ static void DrawProbeOverlay(reshade::api::effect_runtime * /*runtime*/)
                 g_pending.snap = s;
                 g_pending.candidate_rank = uint32_t(candidate);
                 g_pending.armed_frame = g_frame.load(std::memory_order_relaxed);
-                g_pending.desired_exit = uint32_t(std::max(1, occurrence));
+                g_pending.capture_point = uint32_t(capture_point);
+                g_pending.desired_occurrence = uint32_t(std::max(1, occurrence));
                 g_pending.stage = 1;
+                armed_handle = s.handle;
                 status = 1;
             }
             else status = 3;
         }
         else status = 4;
         ReleaseSRWLockExclusive(&g_lock);
-        if (status == 1) Log("[probe] capture armed for RT exit %d", std::max(1, occurrence));
+        if (status == 1) Log("[probe] capture armed: resource=0x%016llX mode=%s occurrence=%d",
+                             (unsigned long long)armed_handle, CapturePointName(uint32_t(capture_point)),
+                             std::max(1, occurrence));
         else if (status == 2) Log("[probe] capture already pending");
         else if (status == 3) Log("[probe] capture rejected: candidate resource is no longer alive");
         else Log("[probe] capture: no candidate #%d in the submitted-frame ranking", candidate);
     }
 
-    int pending_stage = 0;
+    PendingCapture pending_copy;
+    LastCaptureResult last_copy;
     std::vector<Snapshot> top;
     AcquireSRWLockShared(&g_lock);
-    pending_stage = g_pending.stage;
+    pending_copy = g_pending;
+    last_copy = g_last_capture;
     top = g_top;
     ReleaseSRWLockShared(&g_lock);
-    if (pending_stage == 1) ImGui::Text("Capture armed; waiting for selected RT exit");
-    else if (pending_stage == 2) ImGui::Text("Capture resources are being recorded");
-    else if (pending_stage == 3) ImGui::Text("Capture recorded; waiting for command-list submission");
-    else if (pending_stage == 4 || pending_stage == 5) ImGui::Text("Capture submitted; waiting for GPU completion");
+    if (pending_copy.stage == 1)
+        ImGui::Text("Capture armed: %s #%u (barriers=%u, safe=%u)", CapturePointName(pending_copy.capture_point),
+                    pending_copy.desired_occurrence, pending_copy.all_barriers, pending_copy.observed_points);
+    else if (pending_copy.stage == 2) ImGui::Text("Capture resources are being recorded");
+    else if (pending_copy.stage == 3) ImGui::Text("Capture recorded; waiting for command-list submission");
+    else if (pending_copy.stage == 4 || pending_copy.stage == 5) ImGui::Text("Capture submitted; waiting for GPU completion");
+
+    if (last_copy.status != CaptureResultStatus::none)
+    {
+        const PendingCapture &last = last_copy.capture;
+        ImGui::Text("Last capture: %s - %s", CaptureResultName(last_copy.status), last_copy.reason);
+        ImGui::TextDisabled("%s #%u | barriers=%u exits=%u reuses=%u safe=%u | render pass=%u/%u",
+                            CapturePointName(last.capture_point), last.desired_occurrence, last.all_barriers,
+                            last.observed_exits, last.observed_reuses, last.observed_points,
+                            last.render_pass_begins, last.render_pass_ends);
+        ImGui::TextDisabled("skipped: in-pass=%u no-submitted-draw=%u | last usage 0x%X -> 0x%X",
+                            last.skipped_inside_render_pass, last.skipped_without_submitted_draw,
+                            unsigned(last.last_old_state), unsigned(last.last_new_state));
+    }
     ImGui::Separator();
 
     if (top.empty()) { ImGui::TextDisabled("No submitted candidates in the latest frame"); return; }
