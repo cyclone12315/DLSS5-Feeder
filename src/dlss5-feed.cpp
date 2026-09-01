@@ -233,7 +233,7 @@ struct Cfg
     int   log_frames;      // how many first frames get a full parameter dump in the log
     int   create_delay;    // frames to hold the FIRST feature create (the DLSS 5 add-on arms its NGX hooks asynchronously)
     int   preset;          // DLSS render preset hint: 0 default, 5=E, 6=F (legacy CNN), 10=J, 11=K (transformer)
-    int   work_resolution; // 64-bit D3D11 and Vulkan: 50..100 percent of each backbuffer axis
+    int   work_resolution; // 64-bit D3D11 and Vulkan: 20..100 percent of each backbuffer axis
     float mv_scale_x;      // multiplier applied to the motion vectors (the FX already outputs pixels)
     float mv_scale_y;
 };
@@ -312,7 +312,7 @@ static bool CfgReload()
     }
     fclose(f);
     if (next.mode < 0 || next.mode > 2) next.mode = g_cfg.mode;
-    if (next.work_resolution < 50 || next.work_resolution > 100) next.work_resolution = g_cfg.work_resolution;
+    if (next.work_resolution < 20 || next.work_resolution > 100) next.work_resolution = g_cfg.work_resolution;
 
     const bool rebuild = next.hdr != g_cfg.hdr || next.depth_inverted != g_cfg.depth_inverted ||
                          next.flags != g_cfg.flags || next.rebuild != g_cfg.rebuild ||
@@ -1161,13 +1161,13 @@ static bool MakeBlitShaders()
     return true;
 }
 
-static bool CreateDlssFeature(UINT w, UINT h, bool inverted, bool *crashed);
+static bool CreateDlssFeature(UINT w, UINT h, UINT target_w, UINT target_h, bool inverted, bool *crashed);
 
 // A same-size rebuild (warm-up, runtime recreation, cfg knob) only needs a fresh feature:
 // the textures stay put, the new feature is created FIRST, and if that fails or crashes
 // the old feature keeps working -- a flaky re-create can no longer take the feed down.
 // (The DLSS 5 add-on has crashed twice inside a release-then-recreate; never again.)
-static bool RecreateFeatureOnly(UINT w, UINT h)
+static bool RecreateFeatureOnly(UINT w, UINT h, UINT target_w, UINT target_h)
 {
     const bool inverted = g_cfg.depth_inverted >= 0 ? g_cfg.depth_inverted != 0 : g.depth_reversed;
     g.hdr = g_cfg.hdr >= 0 ? g_cfg.hdr != 0 : IsHdrFormat(g.color_fmt);
@@ -1175,7 +1175,7 @@ static bool RecreateFeatureOnly(UINT w, UINT h)
     NVSDK_NGX_Handle *old = g.feature;
     g.feature = nullptr;
     bool crashed = false;
-    if (CreateDlssFeature(w, h, inverted, &crashed))
+    if (CreateDlssFeature(w, h, target_w, target_h, inverted, &crashed))
     {
         DrainGpu();  // the old feature's last evaluate may still be in flight
         SafeReleaseFeature(old);
@@ -1193,7 +1193,7 @@ static bool BuildResources(UINT w, UINT h, UINT backbuffer_w, UINT backbuffer_h,
     if (g.session_ready && g_cfg.mode >= 2 && g.feature != nullptr && g.tex12[SLOT_COLOR] != nullptr &&
         w == g.width && h == g.height && backbuffer_w == g.backbuffer_width &&
         backbuffer_h == g.backbuffer_height && bb_fmt == g.bb_fmt)
-        return RecreateFeatureOnly(w, h);
+        return RecreateFeatureOnly(w, h, w, h);
 
     Breadcrumb("building shared textures");
     ReleaseFrameResources();
@@ -1277,7 +1277,7 @@ static bool BuildResources(UINT w, UINT h, UINT backbuffer_w, UINT backbuffer_h,
     if (g_cfg.mode < 2) { g.frame_ready = true; g.need_reset = true; Log("[feed] transport ready (mode %d, no NGX feature)", g_cfg.mode); return true; }
 
     bool crashed = false;
-    if (!CreateDlssFeature(w, h, inverted, &crashed))
+    if (!CreateDlssFeature(w, h, w, h, inverted, &crashed))
     {
         if (crashed) FeedDisable("creating the DLSS feature crashed (the DLSS 5 add-on may be incompatible)");
         return false;
@@ -1285,9 +1285,13 @@ static bool BuildResources(UINT w, UINT h, UINT backbuffer_w, UINT backbuffer_h,
     return true;
 }
 
-// The DLSS contract, shared by the D3D11 and D3D12 paths. DLAA: render size == output
-// size, no jitter, MVs at render size. The DLSS 5 add-on captures this create inline.
-static bool CreateDlssFeature(UINT w, UINT h, bool inverted, bool *crashed)
+// The DLSS contract, shared by the D3D11 and D3D12 paths. target == render means DLAA
+// (the old 1:1 contract the DLSS 5 add-on was validated against); target > render is
+// true Super Resolution: DLSS reconstructs the native-size output from the reduced
+// render, no spatial resampler involved. No jitter either way (a feed cannot inject
+// game projection jitter), so SR runs in its degraded zero-jitter mode. The DLSS 5
+// add-on captures this create inline.
+static bool CreateDlssFeature(UINT w, UINT h, UINT target_w, UINT target_h, bool inverted, bool *crashed)
 {
     if (crashed != nullptr) *crashed = false;
     int flags = NVSDK_NGX_DLSS_Feature_Flags_MVLowRes | NVSDK_NGX_DLSS_Feature_Flags_AutoExposure;
@@ -1296,12 +1300,24 @@ static bool CreateDlssFeature(UINT w, UINT h, bool inverted, bool *crashed)
     if (g_cfg.flags >= 0) flags = g_cfg.flags;
     g.create_flags = flags;
 
+    // DLAA at 1:1; below that, map the render/target pixel ratio onto NGX's quality
+    // ladder (the ratio itself stays free-form -- the slider is not limited to presets).
+    NVSDK_NGX_PerfQuality_Value pq = NVSDK_NGX_PerfQuality_Value_DLAA;
+    if (target_w != w || target_h != h)
+    {
+        const float ratio = (static_cast<float>(w) * h) / (static_cast<float>(target_w) * target_h);
+        pq = ratio >= 0.85f ? NVSDK_NGX_PerfQuality_Value_UltraQuality :
+             ratio >= 0.65f ? NVSDK_NGX_PerfQuality_Value_MaxQuality :
+             ratio >= 0.45f ? NVSDK_NGX_PerfQuality_Value_Balanced :
+                              NVSDK_NGX_PerfQuality_Value_MaxPerf;
+    }
+
     NVSDK_NGX_DLSS_Create_Params cp = {};
     cp.Feature.InWidth            = w;
     cp.Feature.InHeight           = h;
-    cp.Feature.InTargetWidth      = w;
-    cp.Feature.InTargetHeight     = h;
-    cp.Feature.InPerfQualityValue = NVSDK_NGX_PerfQuality_Value_DLAA;
+    cp.Feature.InTargetWidth      = target_w;
+    cp.Feature.InTargetHeight     = target_h;
+    cp.Feature.InPerfQualityValue = pq;
     cp.InFeatureCreateFlags       = flags;
     cp.InEnableOutputSubrects     = false;
 
@@ -1345,8 +1361,9 @@ static bool CreateDlssFeature(UINT w, UINT h, bool inverted, bool *crashed)
         return false;
     }
 
-    Log("[feed] feature ready: %ux%u DLAA, flags=%d (%s%s%s%s), color %s -> output %s, depth R32_FLOAT%s, mv R16G16_FLOAT",
-        w, h, flags,
+    Log("[feed] feature ready: %ux%u -> %ux%u %s, flags=%d (%s%s%s%s), color %s -> output %s, depth R32_FLOAT%s, mv R16G16_FLOAT",
+        w, h, target_w, target_h, (target_w == w && target_h == h) ? "DLAA" : "SuperResolution",
+        flags,
         (flags & NVSDK_NGX_DLSS_Feature_Flags_IsHDR) ? "HDR " : "SDR ",
         (flags & NVSDK_NGX_DLSS_Feature_Flags_MVLowRes) ? "MVLowRes " : "",
         (flags & NVSDK_NGX_DLSS_Feature_Flags_DepthInverted) ? "DepthInverted " : "",
@@ -1656,7 +1673,7 @@ static bool BuildResources12(UINT w, UINT h, DXGI_FORMAT bb_fmt)
 {
     if (g.session_ready && g_cfg.mode >= 2 && g.feature != nullptr && g.tex12[SLOT_COLOR] != nullptr &&
         w == g.width && h == g.height && bb_fmt == g.bb_fmt)
-        return RecreateFeatureOnly(w, h);
+        return RecreateFeatureOnly(w, h, w, h);
 
     Breadcrumb("building same-device textures");
     ReleaseFrameResources();
@@ -1694,7 +1711,7 @@ static bool BuildResources12(UINT w, UINT h, DXGI_FORMAT bb_fmt)
     if (g_cfg.mode < 2) { g.frame_ready = true; g.need_reset = true; Log("[feed] transport ready (mode %d, no NGX feature)", g_cfg.mode); return true; }
 
     bool crashed = false;
-    if (!CreateDlssFeature(w, h, inverted, &crashed))
+    if (!CreateDlssFeature(w, h, w, h, inverted, &crashed))
     {
         if (crashed) FeedDisable("creating the DLSS feature crashed (the DLSS 5 add-on may be incompatible)");
         return false;
@@ -1915,15 +1932,16 @@ static bool MakeSharedTexVk(int slot, UINT w, UINT h, DXGI_FORMAT fmt, bool uav,
     return true;
 }
 
-// Work and native (backbuffer) dimensions are tracked separately, mirroring the D3D11
-// BuildResources: everything shared and the DLSS feature live at the WORK size, while
-// g.backbuffer_width/height records what the game actually renders into.
+// Work and native (backbuffer) dimensions are tracked separately. All INPUTS and the
+// DLSS render target live at the WORK size; the OUTPUT texture lives at the NATIVE
+// backbuffer size so DLSS Super Resolution writes the final image directly -- there is
+// no spatial resampler anywhere in the pipeline. 100% keeps render == target (DLAA).
 static bool BuildResourcesVk(UINT work_w, UINT work_h, UINT backbuffer_w, UINT backbuffer_h, DXGI_FORMAT bb_fmt)
 {
     if (g.session_ready && g_cfg.mode >= 2 && g.feature != nullptr && g.tex12[SLOT_COLOR] != nullptr &&
         work_w == g.width && work_h == g.height && backbuffer_w == g.backbuffer_width &&
         backbuffer_h == g.backbuffer_height && bb_fmt == g.bb_fmt)
-        return RecreateFeatureOnly(work_w, work_h);
+        return RecreateFeatureOnly(work_w, work_h, backbuffer_w, backbuffer_h);
 
     Breadcrumb("building the Vulkan-shared textures");
     ReleaseFrameResources();
@@ -1935,6 +1953,8 @@ static bool BuildResourcesVk(UINT work_w, UINT work_h, UINT backbuffer_w, UINT b
     g.bb_fmt     = bb_fmt;
     g.color_fmt  = TypedColorFormat(bb_fmt);
     g.output_fmt = ResolveOutputFormat(g.color_fmt, g.dev12);
+    // The output is native-sized now, so the copy home is always an equal-size
+    // transfer; only the SameTexelLayout choice between copy and blit remains.
     Log("[feed] copy home: %s (output %s -> backbuffer %s)",
         SameTexelLayout(g.output_fmt, bb_fmt) ? "raw vkCmdCopyImage" : "vkCmdBlitImage (CONVERTS: expect issue #11 washout)",
         FormatName(g.output_fmt), FormatName(bb_fmt));
@@ -1954,7 +1974,7 @@ static bool BuildResourcesVk(UINT work_w, UINT work_h, UINT backbuffer_w, UINT b
     const reshade::api::resource_usage copy_rw =
         reshade::api::resource_usage::copy_dest | reshade::api::resource_usage::copy_source;
     if (!MakeSharedTexVk(SLOT_COLOR,  work_w, work_h, g.color_fmt,             false, copy_rw, reshade::api::resource_usage::copy_dest) ||
-        !MakeSharedTexVk(SLOT_OUTPUT, work_w, work_h, g.output_fmt,            true,  copy_rw, reshade::api::resource_usage::copy_source) ||
+        !MakeSharedTexVk(SLOT_OUTPUT, backbuffer_w, backbuffer_h, g.output_fmt, true,  copy_rw, reshade::api::resource_usage::copy_source) ||
         !MakeSharedTexVk(SLOT_DEPTH,  work_w, work_h, DXGI_FORMAT_R32_FLOAT,   false, copy_rw, reshade::api::resource_usage::copy_dest) ||
         !MakeSharedTexVk(SLOT_MV,     work_w, work_h, DXGI_FORMAT_R16G16_FLOAT, false, copy_rw, reshade::api::resource_usage::copy_dest) ||
         !MakeSharedTexVk(SLOT_MASK,   work_w, work_h, DXGI_FORMAT_R8_UNORM,     false, copy_rw, reshade::api::resource_usage::copy_dest))
@@ -1966,7 +1986,7 @@ static bool BuildResourcesVk(UINT work_w, UINT work_h, UINT backbuffer_w, UINT b
     if (g_cfg.mode < 2) { g.frame_ready = true; g.need_reset = true; Log("[feed] transport ready (mode %d, no NGX feature)", g_cfg.mode); return true; }
 
     bool crashed = false;
-    if (!CreateDlssFeature(work_w, work_h, inverted, &crashed))
+    if (!CreateDlssFeature(work_w, work_h, backbuffer_w, backbuffer_h, inverted, &crashed))
     {
         if (crashed) FeedDisable("creating the DLSS feature crashed (the DLSS 5 add-on may be incompatible)");
         return false;
@@ -2201,7 +2221,7 @@ static bool BuildResourcesGl(UINT w, UINT h, DXGI_FORMAT bb_fmt, uint64_t rtv_ha
 {
     if (g.session_ready && g_cfg.mode >= 2 && g.feature != nullptr && g.tex12[SLOT_COLOR] != nullptr &&
         w == g.width && h == g.height && bb_fmt == g.bb_fmt)
-        return RecreateFeatureOnly(w, h);
+        return RecreateFeatureOnly(w, h, w, h);
 
     Breadcrumb("building the OpenGL-shared textures");
     ReleaseFrameResources();
@@ -2251,7 +2271,7 @@ static bool BuildResourcesGl(UINT w, UINT h, DXGI_FORMAT bb_fmt, uint64_t rtv_ha
     if (g_cfg.mode < 2) { g.frame_ready = true; g.need_reset = true; Log("[feed] transport ready (mode %d, no NGX feature)", g_cfg.mode); return true; }
 
     bool crashed = false;
-    if (!CreateDlssFeature(w, h, inverted, &crashed))
+    if (!CreateDlssFeature(w, h, w, h, inverted, &crashed))
     {
         if (crashed) FeedDisable("creating the DLSS feature crashed (the DLSS 5 add-on may be incompatible)");
         return false;
@@ -2825,8 +2845,9 @@ static void FeedFrameVk(reshade::api::effect_runtime *rt, reshade::api::command_
     }
     if (ok && needs_build_vk)
     {
-        Log("[feed] building: %ux%u work resolution (%d%%) -> %ux%u backbuffer %s (Vulkan transport, depth reversed=%d)",
-            work_w, work_h, g_cfg.work_resolution, w, h, FormatName(bbf), g.depth_reversed ? 1 : 0);
+        Log("[feed] building: %ux%u render (%d%%) -> %ux%u output %s (Vulkan transport, %s, depth reversed=%d)",
+            work_w, work_h, g_cfg.work_resolution, w, h, FormatName(bbf),
+            (work_w == w && work_h == h) ? "DLAA" : "SuperResolution", g.depth_reversed ? 1 : 0);
         ok = BuildResourcesVk(work_w, work_h, w, h, bbf);
         if (!ok && (work_w != w || work_h != h))
         {
@@ -3027,35 +3048,20 @@ static void FeedFrameVk(reshade::api::effect_runtime *rt, reshade::api::command_
             cb = reinterpret_cast<VkCommandBuffer>(cl->get_native());  // fresh buffer after the flush
             if (done)
             {
-                if (work_w == w && work_h == h)
-                {
-                    // Prefer the raw copy. vkCmdBlitImage converts, and that conversion is
-                    // sRGB-aware: blitting our linear-typed output into a VK_FORMAT_*_SRGB
-                    // swapchain applies a linear->sRGB encode and the frame comes back much
-                    // brighter with lifted blacks (issue #11). The frame we were handed is
-                    // already encoded, so the bytes must go home untouched. The blit stays
-                    // only for the layouts a raw copy genuinely cannot express.
-                    if (SameTexelLayout(g.output_fmt, g.bb_fmt))
-                        FeedVkCopyImage(&g.vk, cb, g.vk_img[SLOT_OUTPUT], VK_IMAGE_LAYOUT_GENERAL,
-                                        bb_img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, w, h);
-                    else
-                        FeedVkBlitImage(&g.vk, cb, g.vk_img[SLOT_OUTPUT], VK_IMAGE_LAYOUT_GENERAL,
-                                        bb_img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, w, h, w, h, VK_FILTER_NEAREST);
-                }
+                // The output texture is NATIVE-sized now (DLSS Super Resolution writes the
+                // final image directly), so the copy home is always equal-size. Prefer the
+                // raw copy. vkCmdBlitImage converts, and that conversion is sRGB-aware:
+                // blitting our linear-typed output into a VK_FORMAT_*_SRGB swapchain
+                // applies a linear->sRGB encode and the frame comes back much brighter
+                // with lifted blacks (issue #11). The frame we were handed is already
+                // encoded, so the bytes must go home untouched. The blit stays only for
+                // the layouts a raw copy genuinely cannot express.
+                if (SameTexelLayout(g.output_fmt, g.bb_fmt))
+                    FeedVkCopyImage(&g.vk, cb, g.vk_img[SLOT_OUTPUT], VK_IMAGE_LAYOUT_GENERAL,
+                                    bb_img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, w, h);
                 else
-                {
-                    // Reduced work resolution: the DLSS output lives at the work size and is
-                    // scaled up to the native backbuffer with a LINEAR blit. POC color-space
-                    // caveat: an SRGB-family backbuffer makes this blit apply a linear->sRGB
-                    // encode over already-encoded bytes (the same mechanism as issue #11),
-                    // while the input blit above decoded sRGB->linear -- whether the two
-                    // conversions cancel depends on the exact format pair. Logged at build
-                    // time; any residual brightness shift is a known POC limitation, not
-                    // something this path tries to correct.
                     FeedVkBlitImage(&g.vk, cb, g.vk_img[SLOT_OUTPUT], VK_IMAGE_LAYOUT_GENERAL,
-                                    bb_img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-                                    work_w, work_h, w, h, VK_FILTER_LINEAR);
-                }
+                                    bb_img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, w, h, w, h, VK_FILTER_NEAREST);
             }
             {
                 const resource       res[1]  = { bb_res };
@@ -3069,7 +3075,7 @@ static void FeedFrameVk(reshade::api::effect_runtime *rt, reshade::api::command_
                 const UINT64 fn = ++g.frames_done;
                 g.consecutive_fails = 0;
                 if (fn <= static_cast<UINT64>(g_cfg.log_frames) || (fn % 1800) == 0)
-                    Log("[feed] frame %llu delivered (%ux%u at %d%% -> %ux%u backbuffer, reset=%d, Vulkan transport)",
+                    Log("[feed] frame %llu delivered (%ux%u render at %d%% -> %ux%u output, reset=%d, Vulkan transport)",
                         fn, g.width, g.height, g_cfg.work_resolution, g.backbuffer_width, g.backbuffer_height, reset);
 
                 if (g_cfg.warmup_rebuild > 0 && !g.warmup_done && !g_renodx_lazy && fn >= static_cast<UINT64>(g_cfg.warmup_rebuild))
@@ -3807,9 +3813,7 @@ static void DrawOverlay(reshade::api::effect_runtime *rt)
     }
 
     ImGui::Separator();
-    ImGui::TextUnformatted("DLSS contract");
-    static const char *kModes[] = { "Inert", "Transport test (no NGX)", "Full DLSS path" };
-    if (ImGui::Combo("Mode", &g_cfg.mode, kModes, 3)) dirty = true;
+    ImGui::TextUnformatted("DLSS Super Resolution");
     const bool adjustable_work_resolution = rt != nullptr &&
         (rt->get_device()->get_api() == reshade::api::device_api::d3d11 ||
          rt->get_device()->get_api() == reshade::api::device_api::vulkan);
@@ -3817,23 +3821,31 @@ static void DrawOverlay(reshade::api::effect_runtime *rt)
     {
         if (g_pending_work_resolution == 0 && g_work_resolution_ui != g_cfg.work_resolution)
             g_work_resolution_ui = g_cfg.work_resolution;
-        if (ImGui::SliderInt("Work resolution (%)", &g_work_resolution_ui, 50, 100))
+        if (ImGui::SliderInt("Render scale (%)", &g_work_resolution_ui, 20, 100))
         {
             g_pending_work_resolution = g_work_resolution_ui;
             g_work_resolution_apply_after = GetTickCount64() + 400;
         }
-        ImGui::SameLine(); HelpMarker("Scales both axes of the private DLAA + Neural Rendering work textures. "
-                                      "The game/backbuffer stays native-sized. Applied once 400 ms after dragging stops.");
+        ImGui::SameLine(); HelpMarker("DLSS input resolution as a percentage of the window/backbuffer, each axis. "
+                                      "The OUTPUT is always the native window size: DLSS Super Resolution reconstructs "
+                                      "the final image from the reduced render (no spatial upscaler involved; no game "
+                                      "jitter is available in a feed, so quality is slightly below in-game DLSS). "
+                                      "100% is plain DLAA. Applied once 400 ms after dragging stops.");
         if (g_pending_work_resolution != 0)
             ImGui::TextDisabled("Pending: %d%%", g_pending_work_resolution);
         else if (g.backbuffer_width != 0)
-            ImGui::TextDisabled("Active: %ux%u (%d%%) -> %ux%u", g.width, g.height,
-                                g_cfg.work_resolution, g.backbuffer_width, g.backbuffer_height);
+            ImGui::TextDisabled("Active: %ux%u render -> %ux%u output (%d%%)", g.width, g.height,
+                                g.backbuffer_width, g.backbuffer_height, g_cfg.work_resolution);
     }
     else
     {
-        ImGui::TextDisabled("Work resolution: 100%% (adjustable path currently supports 64-bit D3D11 and Vulkan)");
+        ImGui::TextDisabled("Render scale: 100%% DLAA (adjustable path currently supports 64-bit D3D11 and Vulkan)");
     }
+
+    ImGui::Separator();
+    ImGui::TextUnformatted("DLSS contract");
+    static const char *kModes[] = { "Inert", "Transport test (no NGX)", "Full DLSS path" };
+    if (ImGui::Combo("Mode", &g_cfg.mode, kModes, 3)) dirty = true;
     static const char *kTri[] = { "Auto", "Force off", "Force on" };
     int hdr_idx = g_cfg.hdr + 1, di_idx = g_cfg.depth_inverted + 1;
     if (ImGui::Combo("HDR", &hdr_idx, kTri, 3)) { g_cfg.hdr = hdr_idx - 1; dirty = true; }
